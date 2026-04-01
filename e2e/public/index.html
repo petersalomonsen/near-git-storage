@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>NEAR Git Storage - HTTP Server Test</title>
+    <style>
+        body { font-family: monospace; max-width: 640px; margin: 2rem auto; padding: 0 1rem; }
+        #status { margin-top: 1rem; white-space: pre-wrap; background: #f6f8fa; padding: 1rem; border-radius: 6px; }
+        #status.success { background: #dafbe1; color: #1a7f37; }
+        #status.error   { background: #ffebe9; color: #cf222e; }
+    </style>
+</head>
+<body>
+    <h1>NEAR Git Storage - HTTP Server Test</h1>
+    <p>wasm-git &rarr; HTTP git server &rarr; NEAR sandbox</p>
+    <div id="status">Initializing...</div>
+
+    <script type="module">
+        const GIT_SERVER_ORIGIN = location.origin;
+        const repoUrl = `${GIT_SERVER_ORIGIN}/repo`;
+        const statusEl = document.getElementById('status');
+
+        function log(msg) {
+            statusEl.textContent += '\n' + msg;
+        }
+
+        let worker, resolveNext;
+        function createWorker() {
+            if (worker) worker.terminate();
+            worker = new Worker(new URL('worker.js', import.meta.url), { type: 'module' });
+            worker.onmessage = (msg) => resolveNext?.(msg.data);
+        }
+        const next = () => new Promise(resolve => { resolveNext = resolve; });
+        const send = (command, params = {}) => {
+            worker.postMessage({ command, ...params });
+            return next();
+        };
+
+        async function clearOPFS(repoName) {
+            try {
+                const root = await navigator.storage.getDirectory();
+                await root.removeEntry(repoName, { recursive: true });
+            } catch (e) {}
+        }
+
+        async function main() {
+            statusEl.textContent = 'Starting...';
+
+            // Unregister any stale service workers from other tests
+            const regs = await navigator.serviceWorker.getRegistrations();
+            for (const reg of regs) await reg.unregister();
+
+            await clearOPFS('repo');
+            createWorker();
+            await next();
+            log('Worker ready');
+
+            // Clone empty repo
+            log('Cloning from NEAR git server...');
+            const cloneResult = await send('clone', { url: repoUrl });
+            if (cloneResult.error) throw new Error('Clone failed: ' + cloneResult.error);
+            log('Cloned: ' + JSON.stringify(cloneResult.dircontents));
+
+            // Write, commit, push
+            log('Writing file and pushing...');
+            const pushResult = await send('writecommitandpush', {
+                filename: 'hello.txt',
+                contents: 'Hello from wasm-git via NEAR blockchain!\n',
+            });
+            if (pushResult.error) throw new Error('Push failed: ' + pushResult.error);
+            log('Pushed successfully');
+
+            // Read back
+            log('Reading file...');
+            const readResult = await send('readfile', { filename: 'hello.txt' });
+            log('File contents: ' + (readResult.filecontents || '').trim());
+
+            // Delete local and re-clone to verify persistence
+            log('Deleting local copy...');
+            await send('deletelocal');
+
+            // Create a fresh worker and clear OPFS to ensure clean state
+            await clearOPFS('repo');
+            createWorker();
+            await next(); // wait for 'ready'
+
+            log('Re-cloning to verify blockchain persistence...');
+            const reClone = await send('clone', { url: repoUrl });
+            if (reClone.error) throw new Error('Re-clone failed: ' + reClone.error);
+            log('Re-cloned: ' + JSON.stringify(reClone.dircontents));
+
+            const verifyRead = await send('readfile', { filename: 'hello.txt' });
+            const content = (verifyRead.filecontents || '').trim();
+            log('Verified content: ' + content);
+
+            if (content !== 'Hello from wasm-git via NEAR blockchain!') {
+                throw new Error('Content mismatch after re-clone!');
+            }
+
+            statusEl.classList.add('success');
+            log('\nAll operations completed successfully!');
+            statusEl.id = 'demo-complete';
+        }
+
+        main().catch(err => {
+            console.error(err);
+            statusEl.classList.add('error');
+            statusEl.textContent += '\nError: ' + err.message;
+            statusEl.id = 'demo-error';
+        });
+    </script>
+</body>
+</html>

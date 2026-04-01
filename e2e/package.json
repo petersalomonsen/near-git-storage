@@ -1,0 +1,19 @@
+{
+  "name": "near-git-storage-e2e",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "setup": "mkdir -p public && cp node_modules/wasm-git/lg2_opfs.js public/ && cp node_modules/wasm-git/lg2_opfs.wasm public/",
+    "start": "node serve.mjs",
+    "test": "npx playwright test",
+    "test:http": "npx playwright test tests/http-server.spec.js",
+    "test:sw": "npx playwright test tests/service-worker.spec.js"
+  },
+  "dependencies": {
+    "wasm-git": "^0.0.14"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.52.0"
+  }
+}

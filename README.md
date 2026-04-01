@@ -1,18 +1,19 @@
 # near-git-storage
 
-A NEAR smart contract that implements the Git smart HTTP protocol, enabling decentralized Git repository storage on the NEAR blockchain. Designed as a storage backend for [wasm-git](https://github.com/petersalomonsen/wasm-git) web applications where Git is used as an application data store.
+A NEAR smart contract that stores Git repositories on the NEAR blockchain using an **archival transaction** approach: git object data is embedded in transaction payloads but never stored in contract state. The contract only stores lightweight pointers (refs → SHA → transaction IDs), and the actual data is retrieved from NEAR archival RPC nodes.
 
-## Motivation
+Designed as a decentralized storage backend for [wasm-git](https://github.com/petersalomonsen/wasm-git) web applications where Git is used as an application data store.
 
-Web applications built with wasm-git use Git repositories as their data layer — every user action is a commit, data is versioned by default, and the app works offline via OPFS. But the Git server is still a centralized component.
+## Why the archival approach?
 
-This project replaces the centralized Git server with a NEAR smart contract, making the data layer fully decentralized:
+NEAR contract storage costs ~0.01 NEAR per KB. For a repo with 100 KB of data, that's 1 NEAR (~$5) locked as storage deposit. The archival approach avoids this:
 
-- **User-owned data** — each user's data lives in a Git repo on-chain, controlled by their NEAR account
-- **No server to run** — the smart contract is the Git server
-- **Censorship resistant** — no single party can deny access to the data
-- **Verifiable history** — the blockchain provides an immutable audit trail of all pushes
-- **Git-native governance** — branch protection and required checks can be enforced at the contract level
+| Approach | Cost for 100 KB of git objects |
+|---|---|
+| Contract state storage | ~1 NEAR (storage deposit, locked) |
+| Archival transactions | ~0.001 NEAR (gas only) + ~0.001 NEAR (pointer storage) |
+
+The trick: NEAR archival nodes keep full transaction history forever. We post git objects as transaction payloads, but the contract discards the data after computing the SHA. Only the SHA → transaction ID mapping is stored (52 bytes per object). To retrieve the data later, we fetch the original transaction from an archival RPC node.
 
 ## Architecture
 
@@ -24,154 +25,198 @@ Browser (wasm-git + OPFS)
     │
     ▼
 Service Worker
-    │
     │  intercepts *.git/* requests
     │  translates to NEAR RPC calls
     │
-    ▼
-NEAR Smart Contract
-    │
-    ├── objects: Map<SHA, Vec<u8>>     (git objects: blobs, trees, commits)
-    ├── refs: Map<String, SHA>         (branch/tag pointers)
-    └── packs: Map<PackId, Vec<u8>>    (packfile chunks for transfer)
+    ├──────────────────────────────────────────┐
+    ▼                                          ▼
+NEAR Smart Contract                    NEAR Archival RPC
+    │                                          │
+    ├── refs: Map<refname, SHA>                │  tx(hash, sender) → full transaction
+    ├── objects: Map<SHA, TxHash>  ────────────┘  including function call args
+    └── (no object data stored)                   (= git object bytes)
 ```
 
-wasm-git thinks it's talking to a regular Git HTTP server. The service worker intercepts the requests and translates them into NEAR contract calls. The contract implements the core logic of `git-upload-pack` and `git-receive-pack`.
+### Data flow
 
-## How the Git smart HTTP protocol maps to contract methods
+**Push (store objects):**
 
-The Git smart HTTP protocol has 4 endpoints. Each maps to a contract method:
+```
+1. Client packs git objects into transaction args
+   → calls contract.push_objects(objects: Vec<GitObject>)
+   → contract computes SHA for each, discards data
+   → client receives tx_hash from RPC response
 
-| Git HTTP endpoint | Direction | Contract method |
-|---|---|---|
-| `GET /repo.git/info/refs?service=git-upload-pack` | fetch/clone | `get_refs()` |
-| `POST /repo.git/git-upload-pack` | fetch/clone | `upload_pack(wants, haves)` |
-| `GET /repo.git/info/refs?service=git-receive-pack` | push | `get_refs()` |
-| `POST /repo.git/git-receive-pack` | push | `receive_pack(pack_data, ref_updates)` |
+2. Client registers the transaction
+   → calls contract.register_push(tx_hash, shas: Vec<SHA>, ref_updates)
+   → contract stores SHA → tx_hash mappings (52 bytes each)
+   → contract updates refs
+```
 
-### Contract methods
+**Clone/fetch (retrieve objects):**
+
+```
+1. Client asks for refs
+   → calls contract.get_refs() (view call, free)
+
+2. Client asks which objects it needs
+   → calls contract.get_object_locations(shas: Vec<SHA>) (view call, free)
+   → returns Vec<(SHA, TxHash)>
+
+3. Service worker fetches each transaction from archival RPC
+   → POST archival-rpc.near.org
+     {"method": "tx", "params": {"tx_hash": "...", "sender_id": "..."}}
+   → extracts function call args → git object bytes
+
+4. Service worker assembles objects into packfile response for wasm-git
+```
+
+## Contract storage (minimal)
 
 ```rust
-/// Return all refs (branch/tag pointers)
-fn get_refs() -> Vec<(String, SHA)>
+/// Only pointers — actual data lives in transaction history
+#[near(contract_state)]
+pub struct GitStorage {
+    /// Branch/tag pointers: refname → SHA (e.g., "refs/heads/main" → "abc123...")
+    refs: UnorderedMap<String, SHA>,
 
-/// Handle fetch/clone — build a packfile of requested objects
-/// Returns packfile bytes or URIs to packfile chunks
-fn upload_pack(wants: Vec<SHA>, haves: Vec<SHA>) -> UploadPackResponse
+    /// Object locations: SHA → transaction hash where the data was posted
+    object_txs: UnorderedMap<SHA, CryptoHash>,
 
-/// Handle push — unpack received objects and update refs
-fn receive_pack(pack_data: Vec<u8>, ref_updates: Vec<RefUpdate>)
+    /// Repo owner (only owner can push)
+    owner: AccountId,
+}
 ```
 
-### Packfile handling
+Storage per object: **52 bytes** (20-byte SHA + 32-byte tx hash).
+A repo with 1000 objects costs ~0.0005 NEAR in storage deposit.
 
-The contract must parse and generate Git packfiles — the binary format Git uses to transfer objects efficiently.
+## Contract methods
 
-**On push (`receive_pack`):**
-1. Parse the incoming packfile into individual Git objects
-2. Store each object by its SHA hash
-3. Validate and apply ref updates
+```rust
+/// Store git objects in a transaction. The contract validates SHAs
+/// but does NOT store the object data — only computes and returns SHAs.
+/// The data persists in the transaction's function call args on archival nodes.
+pub fn push_objects(&mut self, objects: Vec<GitObject>) -> Vec<SHA>
 
-**On fetch (`upload_pack`):**
-1. Walk the object graph from "wants" to "haves" to determine needed objects
-2. Pack the needed objects into a packfile
-3. Return the packfile (or chunk URIs if it exceeds transaction limits)
+/// Register a previous push_objects transaction and update refs.
+/// Called after push_objects, with the tx_hash from that transaction.
+pub fn register_push(
+    &mut self,
+    tx_hash: CryptoHash,
+    object_shas: Vec<SHA>,
+    ref_updates: Vec<RefUpdate>,
+)
 
-### Chunking for NEAR transaction limits
+/// Return all refs (view call, free)
+pub fn get_refs(&self) -> Vec<(String, SHA)>
 
-NEAR's max transaction size is **1.5 MB** (1,572,864 bytes as of protocol v69). For repos that exceed this:
+/// Return transaction locations for requested objects (view call, free)
+pub fn get_object_locations(&self, shas: Vec<SHA>) -> Vec<(SHA, CryptoHash)>
 
-**Push (large packfiles):** Split across multiple contract calls, each under 1.5 MB. The contract reassembles them before processing.
-
-**Fetch (large responses):** Use Git protocol v2's `packfile-uris` feature. Instead of returning the full packfile, the contract returns URIs to individual chunks:
-
+/// Get the object graph reachable from a set of SHAs (for fetch negotiation)
+/// Returns the SHAs of all objects needed (view call, free)
+pub fn resolve_wants(
+    &self,
+    wants: Vec<SHA>,
+    haves: Vec<SHA>,
+) -> Vec<SHA>
 ```
-packfile-uris:
-  sha1-of-pack-1  near://contract.near/pack/chunk-1
-  sha1-of-pack-2  near://contract.near/pack/chunk-2
-```
-
-The service worker fetches each chunk via separate view calls (free, no gas cost for reads). For typical small app repos (JSON entries, a few hundred KB), a single call is sufficient.
 
 ## Service worker
 
-The service worker intercepts Git HTTP requests from wasm-git and translates them to NEAR RPC calls:
+The service worker translates between the git smart HTTP protocol and NEAR RPC calls:
 
 ```javascript
 self.addEventListener('fetch', (event) => {
     const url = new URL(event.request.url);
+    if (!url.pathname.includes('.git/')) return;
 
     if (url.pathname.endsWith('/info/refs')) {
-        // Call contract.get_refs()
-        // Format response as git pkt-line
+        // View call: contract.get_refs()
+        // Format as git pkt-line response
     }
     else if (url.pathname.endsWith('/git-upload-pack')) {
-        // Parse wants/haves from request body
-        // Call contract.upload_pack(wants, haves)
-        // If response contains packfile-uris, fetch each chunk
-        // Return assembled packfile response
+        // 1. Parse wants/haves from request body
+        // 2. View call: contract.resolve_wants(wants, haves)
+        // 3. View call: contract.get_object_locations(needed_shas)
+        // 4. Fetch each tx from archival RPC, extract object bytes
+        // 5. Assemble into packfile, return to wasm-git
     }
     else if (url.pathname.endsWith('/git-receive-pack')) {
-        // Read packfile + ref updates from request body
-        // If > 1.5MB, split into chunks and call contract multiple times
-        // Call contract.receive_pack(pack_data, ref_updates)
-        // Return success/failure response
+        // 1. Parse packfile from request body into individual objects
+        // 2. Call: contract.push_objects(objects) → get tx_hash
+        // 3. Call: contract.register_push(tx_hash, shas, ref_updates)
+        // 4. Return success/failure to wasm-git
     }
 });
 ```
 
-## Contract storage
+## Object graph walking
 
-Git objects are content-addressed (keyed by SHA hash) and immutable — you only ever insert, never update. This maps naturally to blockchain storage:
+For `resolve_wants`, the contract needs to know the structure of commits and trees (which objects reference which). Since object data isn't stored in contract state, there are two options:
 
-| Data | Key | Value | Mutability |
-|---|---|---|---|
-| Git objects | SHA (20 bytes) | Compressed object bytes | Immutable (write-once) |
-| Refs | Refname string | SHA (20 bytes) | Mutable (branch pointers move) |
-| Pack chunks | Chunk ID | Packfile bytes | Temporary (can be cleaned up) |
+**Option A: Store a lightweight object graph in contract state.**
+During `push_objects`, parse just enough to record parent relationships:
+- Commit → parent commit SHAs + tree SHA
+- Tree → child blob/tree SHAs
 
-**Storage costs:** NEAR charges ~0.01 NEAR per KB of storage. A typical app repo with a few hundred small JSON entries might use 100-500 KB, costing 1-5 NEAR in storage deposit.
+This adds ~40-60 bytes per object but enables the contract to walk the graph for fetch negotiation.
 
-## Rust implementation
+**Option B: Let the service worker walk the graph.**
+The service worker fetches objects from archival RPC, parses them locally, and determines what's needed. The contract only provides ref → SHA and SHA → tx_hash mappings. Simpler contract, more work in the service worker.
 
-The contract uses `gix-pack` and `gix-object` from the [gitoxide](https://github.com/Byron/gitoxide) project for packfile parsing and generation. These are pure Rust and compile to wasm32.
+## Testing with near-sandbox
 
-**MVP scope (no delta compression):** Store and transfer raw objects only, skip delta compression. This makes packfiles larger but dramatically simplifies the implementation. For small app repos the size difference is negligible.
+The project uses [near-workspaces-rs](https://github.com/near/near-workspaces-rs) with [near-sandbox-rs](https://github.com/near/near-sandbox-rs) for local testing. Tests run against a local NEAR sandbox node — no testnet needed.
 
-### Key dependencies
+```rust
+#[tokio::test]
+async fn test_push_and_fetch() {
+    let worker = near_workspaces::sandbox().await.unwrap();
+    let contract = worker.dev_deploy(WASM_BYTES).await.unwrap();
 
-- `near-sdk` — NEAR smart contract SDK
-- `gix-pack` — Packfile parsing and generation
-- `gix-object` — Git object parsing (blob, tree, commit)
-- `gix-hash` — SHA-1 hashing for object IDs
-- `gix-traverse` — Object graph walking for upload-pack
+    // Push objects
+    let result = contract.call("push_objects")
+        .args_json(json!({"objects": [{"type": "blob", "data": "..."}]}))
+        .transact().await.unwrap();
+    let tx_hash = result.outcome().transaction_hash;
 
-## Multi-tenancy
+    // Register push
+    contract.call("register_push")
+        .args_json(json!({
+            "tx_hash": tx_hash,
+            "object_shas": ["abc123..."],
+            "ref_updates": [{"name": "refs/heads/main", "new_sha": "abc123..."}]
+        }))
+        .transact().await.unwrap();
 
-Each NEAR account can have its own set of repos. The contract can be deployed once and serve multiple users:
-
+    // Verify refs
+    let refs: Vec<(String, String)> = contract.view("get_refs")
+        .await.unwrap().json().unwrap();
+    assert_eq!(refs[0].0, "refs/heads/main");
+}
 ```
-contract.near/user1/app-data.git
-contract.near/user2/app-data.git
-```
 
-Access control is native to NEAR — only the repo owner's account can push. Anyone can clone (public repos) or access can be restricted via contract-level checks.
+## Archival RPC considerations
 
-## Future: Git-native governance on-chain
-
-Since the contract controls push acceptance, it can enforce governance rules:
-
-- **Branch protection** — reject direct pushes to `main`, require merges from feature branches
-- **Required checks** — run validation scripts (stored in the repo) before accepting a push
-- **Policy-as-code** — governance rules are themselves versioned in the repo; changing them requires a reviewed merge
-- **Audit trail** — every push is a blockchain transaction, providing cryptographic proof of who changed what and when
+- **Providers**: NEAR Foundation, Pagoda, Lava Network, or self-hosted archival nodes
+- **Reliability**: archival nodes keep all transaction history, but availability depends on the provider
+- **Latency**: fetching from archival RPC is slower than direct state reads; consider caching fetched objects in the browser's OPFS or an R2 cache layer
+- **Fallback**: for critical data, optionally mirror to Cloudflare R2 for fast reads
 
 ## Related projects
 
 - [wasm-git](https://github.com/petersalomonsen/wasm-git) — Git compiled to WebAssembly
 - [wasm-git-apps](https://github.com/petersalomonsen/wasm-git-apps) — Devcontainer for AI-driven web app creation using wasm-git
+- [r2-git-server](https://github.com/petersalomonsen/r2-git-server) — Serverless Git server on Cloudflare Workers + R2
 - [gitoxide](https://github.com/Byron/gitoxide) — Pure Rust Git implementation
 - [NEAR Protocol](https://near.org) — Layer 1 blockchain with WebAssembly smart contracts
+
+Sources:
+- [near-sandbox-rs](https://github.com/near/near-sandbox-rs)
+- [near-workspaces-rs](https://github.com/near/near-workspaces-rs)
+- [NEAR Integration Tests](https://docs.near.org/sdk/rust/testing/integration-tests)
 
 ## License
 

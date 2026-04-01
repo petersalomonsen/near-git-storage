@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>NEAR Git Storage - Service Worker Test</title>
+    <style>
+        body { font-family: monospace; max-width: 640px; margin: 2rem auto; padding: 0 1rem; }
+        #status { margin-top: 1rem; white-space: pre-wrap; background: #f6f8fa; padding: 1rem; border-radius: 6px; }
+        #status.success { background: #dafbe1; color: #1a7f37; }
+        #status.error   { background: #ffebe9; color: #cf222e; }
+    </style>
+</head>
+<body>
+    <h1>NEAR Git Storage - Service Worker Test</h1>
+    <p>wasm-git &rarr; service worker &rarr; NEAR sandbox (no HTTP git server)</p>
+    <div id="status">Initializing...</div>
+
+    <script type="module">
+        const statusEl = document.getElementById('status');
+
+        function log(msg) {
+            statusEl.textContent += '\n' + msg;
+        }
+
+        async function main() {
+            statusEl.textContent = 'Starting...';
+
+            // Register the NEAR git service worker (auto-configures on first request)
+            log('Registering NEAR git service worker...');
+            await navigator.serviceWorker.register('/near-git-sw.js');
+            await navigator.serviceWorker.ready;
+            log('Service worker active');
+
+            // The repo URL goes through the service worker
+            const repoUrl = `${location.origin}/near-repo/repo.git`;
+
+            // Create wasm-git worker
+            await clearOPFS('repo.git');
+            const worker = new Worker(new URL('worker.js', import.meta.url), { type: 'module' });
+            let resolveNext;
+            worker.onmessage = (msg) => resolveNext?.(msg.data);
+            const next = () => new Promise(resolve => { resolveNext = resolve; });
+            const send = (command, params = {}) => {
+                worker.postMessage({ command, ...params });
+                return next();
+            };
+
+            await next(); // Wait for worker ready
+            log('Worker ready');
+
+            // Clone empty repo via service worker
+            log('Cloning via service worker...');
+            const cloneResult = await send('clone', { url: repoUrl });
+            if (cloneResult.error) throw new Error('Clone failed: ' + cloneResult.error);
+            log('Cloned: ' + JSON.stringify(cloneResult.dircontents));
+
+            // Write, commit, push (goes through service worker → NEAR contract)
+            log('Writing file and pushing via service worker...');
+            const pushResult = await send('writecommitandpush', {
+                filename: 'sw-hello.txt',
+                contents: 'Hello from wasm-git via NEAR service worker!\n',
+            });
+            if (pushResult.error) throw new Error('Push failed: ' + pushResult.error + '\nstderr: ' + (pushResult.stderr||[]).join('\n'));
+            log('Pushed successfully');
+
+            // Read back
+            log('Reading file...');
+            const readResult = await send('readfile', { filename: 'sw-hello.txt' });
+            log('File contents: ' + (readResult.filecontents || '').trim());
+
+            // Delete local and re-clone to verify persistence
+            log('Deleting local copy...');
+            await send('deletelocal');
+
+            // Create a fresh worker and clear OPFS to ensure clean state
+            worker.terminate();
+            await clearOPFS('repo.git');
+            const worker2 = new Worker(new URL('worker.js', import.meta.url), { type: 'module' });
+            worker2.onmessage = (msg) => resolveNext?.(msg.data);
+            const send2 = (command, params = {}) => {
+                worker2.postMessage({ command, ...params });
+                return next();
+            };
+            await next(); // wait for ready
+
+            log('Re-cloning to verify persistence...');
+            const reClone = await send2('clone', { url: repoUrl });
+            if (reClone.error) throw new Error('Re-clone failed: ' + reClone.error);
+            log('Re-cloned: ' + JSON.stringify(reClone.dircontents));
+
+            const verifyRead = await send2('readfile', { filename: 'sw-hello.txt' });
+            const content = (verifyRead.filecontents || '').trim();
+            log('Verified content: ' + content);
+
+            if (content !== 'Hello from wasm-git via NEAR service worker!') {
+                throw new Error('Content mismatch after re-clone!');
+            }
+
+            statusEl.classList.add('success');
+            log('\nAll operations completed successfully!');
+            statusEl.id = 'demo-complete';
+        }
+
+        async function clearOPFS(repoName) {
+            try {
+                const root = await navigator.storage.getDirectory();
+                await root.removeEntry(repoName, { recursive: true });
+            } catch (e) {}
+        }
+
+        main().catch(err => {
+            console.error(err);
+            statusEl.classList.add('error');
+            statusEl.textContent += '\nError: ' + err.message;
+            statusEl.id = 'demo-error';
+        });
+    </script>
+</body>
+</html>
