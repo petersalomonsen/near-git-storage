@@ -114,8 +114,8 @@ http.createServer((req, res) => {
         return;
     }
 
-    // Proxy /near-info, /near-call, and /parse-packfile to git server
-    if (urlPath === '/near-info' || urlPath === '/near-call' || urlPath === '/parse-packfile') {
+    // Proxy NEAR endpoints to git server
+    if (urlPath === '/near-info' || urlPath === '/near-call' || urlPath === '/near-credentials' || urlPath === '/parse-packfile') {
         proxyToGit(req, res);
         return;
     }

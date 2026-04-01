@@ -1,5 +1,5 @@
-mod packfile;
-mod pktline;
+use git_core::packfile;
+use git_core::pktline;
 
 use std::sync::Arc;
 
@@ -27,6 +27,9 @@ struct AppState {
     contract_id: AccountId,
     owner_id: AccountId,
     owner_signer: Arc<Signer>,
+    /// Raw key strings for the /near-credentials endpoint
+    owner_public_key: String,
+    owner_secret_key: String,
 }
 
 #[derive(Deserialize)]
@@ -50,8 +53,11 @@ async fn main() {
     let genesis_id: AccountId = genesis.account_id.to_string().parse().unwrap();
     let genesis_signer = Signer::from_secret_key(genesis.private_key.parse().unwrap()).unwrap();
 
-    // Create owner account
-    let owner_secret = near_api::signer::generate_secret_key().unwrap();
+    // Create owner account — use NEAR_OWNER_SECRET_KEY from env if set, else generate
+    let owner_secret = match std::env::var("NEAR_OWNER_SECRET_KEY") {
+        Ok(key) => key.parse().expect("invalid NEAR_OWNER_SECRET_KEY"),
+        Err(_) => near_api::signer::generate_secret_key().unwrap(),
+    };
     let owner_id: AccountId = "owner.sandbox".parse().unwrap();
 
     near_api::Account::create_account(owner_id.clone())
@@ -62,6 +68,13 @@ async fn main() {
         .await
         .unwrap()
         .assert_success();
+
+    // Capture key strings for the /near-credentials endpoint
+    let owner_public_key = owner_secret.public_key().to_string();
+    let owner_secret_key = owner_secret.to_string();
+
+    info!("Owner account: {}", owner_id);
+    info!("Owner public key: {}", owner_public_key);
 
     let owner_signer = Signer::from_secret_key(owner_secret).unwrap();
 
@@ -101,6 +114,8 @@ async fn main() {
         contract_id,
         owner_id,
         owner_signer,
+        owner_public_key,
+        owner_secret_key,
     });
 
     // CORS layer for browser-based wasm-git access
@@ -116,6 +131,7 @@ async fn main() {
         .route("/{repo}/git-upload-pack", post(handle_upload_pack))
         .route("/near-call", post(handle_near_call))
         .route("/near-info", get(handle_near_info))
+        .route("/near-credentials", get(handle_near_credentials))
         .route("/parse-packfile", post(handle_parse_packfile))
         .layer(cors)
         .with_state(state);
@@ -670,6 +686,21 @@ async fn handle_near_info(State(state): State<Arc<AppState>>) -> Response {
         "contractId": state.contract_id.to_string(),
     });
     axum::Json(info).into_response()
+}
+
+/// GET /near-credentials — return owner credentials for service worker signing
+async fn handle_near_credentials(State(state): State<Arc<AppState>>) -> Response {
+    let rpc_url = state.network.rpc_endpoints.first()
+        .map(|e| e.url.to_string())
+        .unwrap_or_default();
+    axum::Json(json!({
+        "rpcUrl": rpc_url,
+        "contractId": state.contract_id.to_string(),
+        "accountId": state.owner_id.to_string(),
+        "publicKey": state.owner_public_key,
+        "secretKey": state.owner_secret_key,
+    }))
+    .into_response()
 }
 
 /// POST /near-call — proxy signed contract function calls from the service worker

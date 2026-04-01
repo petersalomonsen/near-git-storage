@@ -1,5 +1,5 @@
 [workspace]
-members = ["git-server"]
+members = ["git-core", "git-server", "wasm-lib"]
 
 [package]
 name = "near-git-storage"

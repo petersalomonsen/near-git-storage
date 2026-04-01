@@ -25,11 +25,37 @@
         async function main() {
             statusEl.textContent = 'Starting...';
 
-            // Register the NEAR git service worker (auto-configures on first request)
+            // Fetch credentials from the sandbox server
+            log('Fetching NEAR credentials...');
+            const credRes = await fetch('/near-credentials');
+            const creds = await credRes.json();
+            // Strip "ed25519:" prefix for the WASM signer
+            const publicKey = creds.publicKey.replace('ed25519:', '');
+            const privateKey = creds.secretKey.replace('ed25519:', '');
+
+            // Register the NEAR git service worker
             log('Registering NEAR git service worker...');
-            await navigator.serviceWorker.register('/near-git-sw.js');
+            await navigator.serviceWorker.register('/near-git-sw.js', { type: 'module' });
             await navigator.serviceWorker.ready;
             log('Service worker active');
+
+            // Wait for the service worker to claim this client
+            if (!navigator.serviceWorker.controller) {
+                await new Promise(resolve => {
+                    navigator.serviceWorker.addEventListener('controllerchange', resolve, { once: true });
+                });
+            }
+
+            // Configure the service worker with credentials
+            navigator.serviceWorker.controller.postMessage({
+                type: 'configure',
+                rpcUrl: creds.rpcUrl,
+                contractId: creds.contractId,
+                accountId: creds.accountId,
+                publicKey,
+                privateKey,
+            });
+            log('Configured with contract=' + creds.contractId + ' account=' + creds.accountId);
 
             // The repo URL goes through the service worker
             const repoUrl = `${location.origin}/near-repo/repo.git`;
