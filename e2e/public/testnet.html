@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>NEAR Git Storage - Testnet Demo</title>
+    <style>
+        body { font-family: monospace; max-width: 720px; margin: 2rem auto; padding: 0 1rem; }
+        #config { margin: 1rem 0; }
+        #config label { display: block; margin: 0.3rem 0; }
+        #config input { font-family: monospace; width: 100%; padding: 0.3rem; box-sizing: border-box; }
+        button { font-family: monospace; padding: 0.5rem 1rem; cursor: pointer; margin-top: 0.5rem; }
+        #status { margin-top: 1rem; white-space: pre-wrap; background: #f6f8fa; padding: 1rem; border-radius: 6px; }
+        #status.success { background: #dafbe1; color: #1a7f37; }
+        #status.error   { background: #ffebe9; color: #cf222e; }
+    </style>
+</head>
+<body>
+    <h1>NEAR Git Storage - Testnet</h1>
+    <p>wasm-git &rarr; service worker &rarr; NEAR testnet</p>
+
+    <div id="config">
+        <label>Contract ID: <input id="contractId" value="wasmgitdemo1.testnet"></label>
+        <label>Account ID (signer): <input id="accountId" placeholder="yourname.testnet"></label>
+        <label>Private key (ed25519:...): <input id="privateKey" type="password" placeholder="ed25519:..."></label>
+        <label>RPC URL: <input id="rpcUrl" value="https://archival-rpc.testnet.fastnear.com"></label>
+        <button id="start">Start demo</button>
+        <button id="save" style="margin-left: 0.5rem;">Save to password manager</button>
+    </div>
+
+    <div id="status"></div>
+
+    <script type="module">
+        const statusEl = document.getElementById('status');
+        const startBtn = document.getElementById('start');
+        const saveBtn = document.getElementById('save');
+
+        function log(msg) {
+            statusEl.textContent += msg + '\n';
+        }
+
+        // Try to restore saved credentials
+        const saved = localStorage.getItem('near-git-config');
+        if (saved) {
+            try {
+                const c = JSON.parse(saved);
+                if (c.accountId) document.getElementById('accountId').value = c.accountId;
+                if (c.rpcUrl) document.getElementById('rpcUrl').value = c.rpcUrl;
+                if (c.contractId) document.getElementById('contractId').value = c.contractId;
+                // Private key is NOT stored in localStorage — use password manager
+            } catch (e) {}
+        }
+
+        saveBtn.addEventListener('click', () => {
+            // Save non-secret config to localStorage
+            localStorage.setItem('near-git-config', JSON.stringify({
+                contractId: document.getElementById('contractId').value,
+                accountId: document.getElementById('accountId').value,
+                rpcUrl: document.getElementById('rpcUrl').value,
+            }));
+            // Trigger the browser's password manager save by focusing the password field
+            alert('Non-secret config saved. Use your browser\'s password manager to save the private key.');
+        });
+
+        startBtn.addEventListener('click', () => {
+            startBtn.disabled = true;
+            statusEl.textContent = '';
+            statusEl.className = '';
+            main().catch(err => {
+                console.error(err);
+                statusEl.classList.add('error');
+                log('Error: ' + err.message);
+                startBtn.disabled = false;
+            });
+        });
+
+        async function main() {
+            const contractId = document.getElementById('contractId').value.trim();
+            const accountId = document.getElementById('accountId').value.trim();
+            const rawPrivateKey = document.getElementById('privateKey').value.trim();
+            const rpcUrl = document.getElementById('rpcUrl').value.trim();
+
+            if (!contractId || !accountId || !rawPrivateKey) {
+                throw new Error('Please fill in contract ID, account ID, and private key');
+            }
+
+            // Derive public key from private key
+            // The private key is "ed25519:<base58 of 32 or 64 bytes>"
+            const privateKey = rawPrivateKey.replace('ed25519:', '');
+
+            log('Deriving public key...');
+            // Import the WASM lib to derive the public key from the secret
+            const wasmLib = await import('./wasm-lib/wasm_lib.js');
+            await wasmLib.default();
+
+            // Decode the private key to get the public key portion
+            const keyBytes = base58Decode(privateKey);
+            let publicKeyB58;
+            if (keyBytes.length === 64) {
+                // Full keypair: last 32 bytes are public key
+                publicKeyB58 = base58Encode(keyBytes.slice(32));
+            } else if (keyBytes.length === 32) {
+                // Just the secret — need to derive pubkey via ed25519
+                // Use a test signing call to derive it, or we can use the WASM lib
+                // For now, ask user to provide it or derive from the secret
+                throw new Error('32-byte private key detected. Please provide the full 64-byte keypair (secret:public) or use `near credentials` to get the full key.');
+            } else {
+                throw new Error('Unexpected key length: ' + keyBytes.length);
+            }
+
+            const publicKey = publicKeyB58;
+            log('Public key: ed25519:' + publicKey);
+
+            // Register service worker
+            log('Registering service worker...');
+            const reg = await navigator.serviceWorker.register('/near-git-sw.js', { type: 'module' });
+            await navigator.serviceWorker.ready;
+
+            if (!navigator.serviceWorker.controller) {
+                await new Promise(resolve => {
+                    navigator.serviceWorker.addEventListener('controllerchange', resolve, { once: true });
+                });
+            }
+            log('Service worker active');
+
+            // Configure
+            navigator.serviceWorker.controller.postMessage({
+                type: 'configure',
+                rpcUrl,
+                contractId,
+                accountId,
+                publicKey,
+                privateKey,
+            });
+            log('Configured: contract=' + contractId + ' account=' + accountId);
+
+            const repoUrl = `${location.origin}/near-repo/repo.git`;
+
+            // Create wasm-git worker
+            await clearOPFS('repo.git');
+            const worker = new Worker(new URL('worker.js', import.meta.url), { type: 'module' });
+            let resolveNext;
+            worker.onmessage = (msg) => resolveNext?.(msg.data);
+            const next = () => new Promise(resolve => { resolveNext = resolve; });
+            const send = (command, params = {}) => {
+                worker.postMessage({ command, ...params });
+                return next();
+            };
+            await next(); // ready
+            log('wasm-git worker ready');
+
+            // Clone
+            log('Cloning from ' + contractId + '...');
+            const cloneResult = await send('clone', { url: repoUrl });
+            if (cloneResult.error) throw new Error('Clone failed: ' + cloneResult.error);
+            log('Cloned: ' + JSON.stringify(cloneResult.dircontents));
+
+            // Write, commit, push
+            const now = new Date().toISOString();
+            const filename = 'hello.txt';
+            const contents = 'Hello from NEAR testnet! ' + now + '\n';
+            log('Writing ' + filename + ' and pushing...');
+            const pushResult = await send('writecommitandpush', { filename, contents });
+            if (pushResult.error) throw new Error('Push failed: ' + pushResult.error + '\nstderr: ' + (pushResult.stderr||[]).join('\n'));
+            log('Pushed successfully!');
+
+            // Read back
+            const readResult = await send('readfile', { filename });
+            log('Read: ' + (readResult.filecontents || '').trim());
+
+            // Re-clone to verify
+            log('Deleting local and re-cloning...');
+            await send('deletelocal');
+            worker.terminate();
+            await clearOPFS('repo.git');
+
+            const worker2 = new Worker(new URL('worker.js', import.meta.url), { type: 'module' });
+            worker2.onmessage = (msg) => resolveNext?.(msg.data);
+            const send2 = (command, params = {}) => {
+                worker2.postMessage({ command, ...params });
+                return next();
+            };
+            await next();
+
+            const reClone = await send2('clone', { url: repoUrl });
+            if (reClone.error) throw new Error('Re-clone failed: ' + reClone.error);
+            log('Re-cloned: ' + JSON.stringify(reClone.dircontents));
+
+            const verifyRead = await send2('readfile', { filename });
+            const content = (verifyRead.filecontents || '').trim();
+            log('Verified: ' + content);
+
+            if (content === contents.trim()) {
+                statusEl.classList.add('success');
+                log('\nAll operations completed successfully!');
+            } else {
+                throw new Error('Content mismatch after re-clone!');
+            }
+            startBtn.disabled = false;
+        }
+
+        async function clearOPFS(repoName) {
+            try {
+                const root = await navigator.storage.getDirectory();
+                await root.removeEntry(repoName, { recursive: true });
+            } catch (e) {}
+        }
+
+        // Minimal base58 encode/decode (NEAR uses base58 for keys)
+        const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+
+        function base58Decode(str) {
+            const bytes = [];
+            for (const c of str) {
+                let carry = BASE58_ALPHABET.indexOf(c);
+                if (carry < 0) throw new Error('Invalid base58 character: ' + c);
+                for (let j = 0; j < bytes.length; j++) {
+                    carry += bytes[j] * 58;
+                    bytes[j] = carry & 0xff;
+                    carry >>= 8;
+                }
+                while (carry > 0) {
+                    bytes.push(carry & 0xff);
+                    carry >>= 8;
+                }
+            }
+            for (const c of str) {
+                if (c !== '1') break;
+                bytes.push(0);
+            }
+            return new Uint8Array(bytes.reverse());
+        }
+
+        function base58Encode(bytes) {
+            const digits = [0];
+            for (const byte of bytes) {
+                let carry = byte;
+                for (let j = 0; j < digits.length; j++) {
+                    carry += digits[j] << 8;
+                    digits[j] = carry % 58;
+                    carry = (carry / 58) | 0;
+                }
+                while (carry > 0) {
+                    digits.push(carry % 58);
+                    carry = (carry / 58) | 0;
+                }
+            }
+            let result = '';
+            for (const b of bytes) {
+                if (b !== 0) break;
+                result += '1';
+            }
+            for (let i = digits.length - 1; i >= 0; i--) {
+                result += BASE58_ALPHABET[digits[i]];
+            }
+            return result;
+        }
+    </script>
+</body>
+</html>

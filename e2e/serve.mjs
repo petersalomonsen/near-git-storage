@@ -132,6 +132,8 @@ http.createServer((req, res) => {
         filePath = path.join('public', 'index.html');
     } else if (urlPath === '/sw-test') {
         filePath = path.join('public', 'index-sw.html');
+    } else if (urlPath === '/testnet') {
+        filePath = path.join('public', 'testnet.html');
     } else {
         filePath = path.join('public', urlPath);
     }
