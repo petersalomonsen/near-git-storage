@@ -12,7 +12,7 @@ export default defineConfig({
             command: 'cd .. && cargo run -p git-server',
             url: 'http://localhost:8080/near-info',
             reuseExistingServer: true,
-            timeout: 60000,
+            timeout: 180000,
         },
         {
             command: 'node serve.mjs',
