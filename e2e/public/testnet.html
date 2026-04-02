@@ -16,6 +16,7 @@
         #compose label { display: block; margin-bottom: 0.25rem; font-weight: bold; }
         #blog-title { width: 100%; box-sizing: border-box; padding: 0.4rem; font-family: monospace; margin-bottom: 0.5rem; }
         #blog-body { width: 100%; box-sizing: border-box; padding: 0.4rem; font-family: monospace; height: 6rem; margin-bottom: 0.5rem; }
+        #privateKey { width: 100%; box-sizing: border-box; padding: 0.3rem; font-family: monospace; margin-bottom: 0.5rem; }
         #publish { padding: 0.4rem 1.2rem; font-family: monospace; cursor: pointer; }
         #publish:disabled { opacity: 0.5; cursor: not-allowed; }
         #posts { margin-top: 1rem; }
@@ -32,7 +33,6 @@
     <div id="config">
         <label>Contract ID <input id="contractId" value="wasmgitdemo1.testnet"></label>
         <label>Account ID (signer) <input id="accountId" placeholder="yourname.testnet"></label>
-        <label>Private key <input id="privateKey" type="password" placeholder="ed25519:..."></label>
         <label>RPC URL <input id="rpcUrl" value="https://archival-rpc.testnet.fastnear.com"></label>
         <button id="connect">Connect</button>
     </div>
@@ -44,7 +44,9 @@
         <input type="text" id="blog-title" placeholder="Post title">
         <label for="blog-body">Body</label>
         <textarea id="blog-body" placeholder="Write your post..."></textarea>
-        <button id="publish" disabled>Publish</button>
+        <label for="privateKey">Private key (needed for publish only)</label>
+        <input id="privateKey" type="password" placeholder="ed25519:...">
+        <button id="publish">Publish</button>
     </div>
 
     <div id="posts"></div>
@@ -58,6 +60,7 @@
         const bodyEl = document.getElementById('blog-body');
         const publishBtn = document.getElementById('publish');
         const connectBtn = document.getElementById('connect');
+        const privateKeyEl = document.getElementById('privateKey');
 
         function setStatus(msg) { statusEl.textContent = msg; }
 
@@ -66,26 +69,22 @@
         const next = () => new Promise(resolve => { resolveNext = resolve; });
 
         // Restore saved config
-        const saved = localStorage.getItem('near-git-config');
-        if (saved) {
+        let savedConfig = null;
+        const savedJson = localStorage.getItem('near-git-config');
+        if (savedJson) {
             try {
-                const c = JSON.parse(saved);
-                if (c.accountId) document.getElementById('accountId').value = c.accountId;
-                if (c.rpcUrl) document.getElementById('rpcUrl').value = c.rpcUrl;
-                if (c.contractId) document.getElementById('contractId').value = c.contractId;
-            } catch (e) {}
+                savedConfig = JSON.parse(savedJson);
+                if (savedConfig.accountId) document.getElementById('accountId').value = savedConfig.accountId;
+                if (savedConfig.rpcUrl) document.getElementById('rpcUrl').value = savedConfig.rpcUrl;
+                if (savedConfig.contractId) document.getElementById('contractId').value = savedConfig.contractId;
+            } catch (e) { savedConfig = null; }
         }
 
         connectBtn.addEventListener('click', () => {
             connectBtn.disabled = true;
             setStatus('');
-            // Save non-secret config
-            localStorage.setItem('near-git-config', JSON.stringify({
-                contractId: document.getElementById('contractId').value,
-                accountId: document.getElementById('accountId').value,
-                rpcUrl: document.getElementById('rpcUrl').value,
-            }));
-            main().catch(err => {
+            saveConfig();
+            connectAndClone().catch(err => {
                 console.error(err);
                 setStatus('Error: ' + err.message);
                 connectBtn.disabled = false;
@@ -94,30 +93,26 @@
 
         publishBtn.addEventListener('click', publish);
 
-        async function main() {
-            const contractId = document.getElementById('contractId').value.trim();
-            const accountId = document.getElementById('accountId').value.trim();
-            const rawPrivateKey = document.getElementById('privateKey').value.trim();
-            const rpcUrl = document.getElementById('rpcUrl').value.trim();
+        function saveConfig() {
+            savedConfig = {
+                contractId: document.getElementById('contractId').value.trim(),
+                accountId: document.getElementById('accountId').value.trim(),
+                rpcUrl: document.getElementById('rpcUrl').value.trim(),
+            };
+            localStorage.setItem('near-git-config', JSON.stringify(savedConfig));
+        }
 
-            if (!contractId || !accountId || !rawPrivateKey) {
-                throw new Error('Please fill in contract ID, account ID, and private key');
-            }
+        async function createWorker() {
+            const worker = new Worker(new URL('worker.js', import.meta.url), { type: 'module' });
+            worker.onmessage = (msg) => resolveNext?.(msg.data);
+            send = (command, params = {}) => {
+                worker.postMessage({ command, ...params });
+                return next();
+            };
+            await next(); // wait for ready
+        }
 
-            const privateKey = rawPrivateKey.replace('ed25519:', '');
-
-            setStatus('Deriving public key...');
-            const keyBytes = base58Decode(privateKey);
-            let publicKey;
-            if (keyBytes.length === 64) {
-                publicKey = base58Encode(keyBytes.slice(32));
-            } else if (keyBytes.length === 32) {
-                throw new Error('32-byte key detected. Please use the full 64-byte keypair from ~/.near-credentials.');
-            } else {
-                throw new Error('Unexpected key length: ' + keyBytes.length);
-            }
-
-            setStatus('Registering service worker...');
+        async function registerSW(cfg) {
             await navigator.serviceWorker.register('/near-git-sw.js', { type: 'module' });
             await navigator.serviceWorker.ready;
             if (!navigator.serviceWorker.controller) {
@@ -125,28 +120,28 @@
                     navigator.serviceWorker.addEventListener('controllerchange', resolve, { once: true });
                 });
             }
-
             navigator.serviceWorker.controller.postMessage({
                 type: 'configure',
-                rpcUrl,
-                contractId,
-                accountId,
-                publicKey,
-                privateKey,
+                rpcUrl: cfg.rpcUrl,
+                contractId: cfg.contractId,
+                accountId: cfg.accountId || '',
+                publicKey: cfg.publicKey || '',
+                privateKey: cfg.privateKey || '',
             });
+        }
+
+        async function connectAndClone() {
+            if (!savedConfig || !savedConfig.contractId || !savedConfig.rpcUrl) {
+                throw new Error('Please fill in contract ID and RPC URL');
+            }
+
+            setStatus('Registering service worker...');
+            await registerSW(savedConfig);
 
             const repoUrl = `${location.origin}/near-repo/repo.git`;
-
             await clearOPFS('repo.git');
-            const worker = new Worker(new URL('worker.js', import.meta.url), { type: 'module' });
-            worker.onmessage = (msg) => resolveNext?.(msg.data);
-            send = (command, params = {}) => {
-                worker.postMessage({ command, ...params });
-                return next();
-            };
-            await next();
 
-            setStatus('Cloning from ' + contractId + '...');
+            setStatus('Cloning from ' + savedConfig.contractId + '...');
             const cloneResult = await send('clone', { url: repoUrl });
             if (cloneResult.error) throw new Error('Clone failed: ' + cloneResult.error);
 
@@ -155,9 +150,55 @@
 
             setStatus('Loading posts...');
             await loadPosts();
-            publishBtn.disabled = false;
-            setStatus('Ready — connected to ' + contractId);
+            setStatus('Ready — connected to ' + savedConfig.contractId);
         }
+
+        async function pullAndRefresh() {
+            if (!savedConfig || !savedConfig.contractId || !savedConfig.rpcUrl) return;
+
+            setStatus('Syncing with ' + savedConfig.contractId + '...');
+            await registerSW(savedConfig);
+
+            const pullResult = await send('pull');
+            if (pullResult.error) {
+                console.warn('Pull failed:', pullResult.error);
+                setStatus('Ready (offline) — showing cached posts');
+                return;
+            }
+            await loadPosts();
+            setStatus('Ready — connected to ' + savedConfig.contractId);
+        }
+
+        // --- Main init: try to show cached content first ---
+        (async () => {
+            try {
+                setStatus('Loading...');
+                await createWorker();
+
+                const openResult = await send('open', { repoName: 'repo.git' });
+                if (openResult.opened) {
+                    // Repo exists in OPFS — show posts immediately
+                    configEl.style.display = 'none';
+                    composeEl.style.display = 'block';
+                    await loadPosts();
+                    setStatus('Ready (cached)');
+
+                    // Pull updates in background
+                    pullAndRefresh().catch(err => {
+                        console.warn('Background pull failed:', err);
+                    });
+                } else if (savedConfig && savedConfig.contractId && savedConfig.rpcUrl) {
+                    // No local repo but have config — clone
+                    await connectAndClone();
+                } else {
+                    // No local repo, no config — show form
+                    setStatus('Enter connection details to get started.');
+                }
+            } catch (err) {
+                console.error(err);
+                setStatus('Error: ' + err.message);
+            }
+        })();
 
         function renderMarkdown(md) {
             const lines = md.split('\n');
@@ -210,10 +251,44 @@
         async function publish() {
             const title = titleEl.value.trim();
             const body = bodyEl.value.trim();
+            const rawPrivateKey = privateKeyEl.value.trim();
+
             if (!title || !body) return;
+            if (!rawPrivateKey) {
+                setStatus('Please enter your private key to publish.');
+                privateKeyEl.focus();
+                return;
+            }
+            if (!savedConfig || !savedConfig.accountId) {
+                setStatus('Please enter your account ID in the connection settings first.');
+                return;
+            }
+
             publishBtn.disabled = true;
             setStatus('Publishing...');
             try {
+                // Derive public key and configure SW with signing credentials
+                const privateKey = rawPrivateKey.replace('ed25519:', '');
+                const keyBytes = base58Decode(privateKey);
+                let publicKey;
+                if (keyBytes.length === 64) {
+                    publicKey = base58Encode(keyBytes.slice(32));
+                } else if (keyBytes.length === 32) {
+                    throw new Error('32-byte key detected. Please use the full 64-byte keypair from ~/.near-credentials.');
+                } else {
+                    throw new Error('Unexpected key length: ' + keyBytes.length);
+                }
+
+                // Re-configure SW with signing credentials for push
+                navigator.serviceWorker.controller.postMessage({
+                    type: 'configure',
+                    rpcUrl: savedConfig.rpcUrl,
+                    contractId: savedConfig.contractId,
+                    accountId: savedConfig.accountId,
+                    publicKey,
+                    privateKey,
+                });
+
                 const timestamp = new Date().toISOString().replace(/[:.]/g, m => m === ':' ? ':' : '.');
                 const filename = `${timestamp}.md`;
                 const contents = `# ${title}\n\n${body}`;
@@ -223,7 +298,7 @@
                 bodyEl.value = '';
                 setStatus('Published! Refreshing...');
                 await loadPosts();
-                setStatus('Ready');
+                setStatus('Ready — connected to ' + savedConfig.contractId);
             } catch (err) {
                 setStatus('Error: ' + err.message);
             } finally {

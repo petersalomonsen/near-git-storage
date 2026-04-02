@@ -3,6 +3,8 @@
  *
  * Message API:
  *   clone              { url }                 → { dircontents }
+ *   open               { repoName }            → { opened, dircontents? }
+ *   pull               {}                      → { dircontents, pullResult }
  *   writecommitandpush { filename, contents }  → { dircontents }
  *   readfile           { filename }            → { filename, filecontents }
  *   listfiles          {}                      → { files }
@@ -85,6 +87,31 @@ onmessage = async (msg) => {
             createMountPointSymlink(repoName);
             FS.chdir(currentRepoDir);
             postMessage({ dircontents: FS.readdir('.'), stdout, stderr });
+
+        } else if (command === 'open') {
+            const repoName = msg.data.repoName;
+            const tryDir = workingDir + '/' + repoName;
+            try {
+                FS.readdir(tryDir);
+                currentRepoDir = tryDir;
+                createMountPointSymlink(repoName);
+                FS.chdir(currentRepoDir);
+                postMessage({ opened: true, dircontents: FS.readdir('.'), stdout, stderr });
+            } catch (e) {
+                postMessage({ opened: false, stdout, stderr });
+            }
+
+        } else if (command === 'pull') {
+            FS.chdir(currentRepoDir);
+            const fetchRet = lg.callMain(['fetch', 'origin']);
+            if (fetchRet !== 0) {
+                postMessage({ error: `git fetch exited with code ${fetchRet}`, stdout, stderr });
+                return;
+            }
+            FS.chdir(currentRepoDir);
+            const mergeRet = lg.callMain(['merge', 'FETCH_HEAD']);
+            FS.chdir(currentRepoDir);
+            postMessage({ dircontents: FS.readdir('.'), pullResult: mergeRet, stdout, stderr });
 
         } else if (command === 'writecommitandpush') {
             FS.chdir(currentRepoDir);
