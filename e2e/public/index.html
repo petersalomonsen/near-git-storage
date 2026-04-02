@@ -2,27 +2,49 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>NEAR Git Storage - HTTP Server Test</title>
+    <title>NEAR Git Storage - Blog</title>
     <style>
         body { font-family: monospace; max-width: 640px; margin: 2rem auto; padding: 0 1rem; }
-        #status { margin-top: 1rem; white-space: pre-wrap; background: #f6f8fa; padding: 1rem; border-radius: 6px; }
-        #status.success { background: #dafbe1; color: #1a7f37; }
-        #status.error   { background: #ffebe9; color: #cf222e; }
+        h1 { margin-bottom: 0.25rem; }
+        h1 + p { color: #666; margin-top: 0; }
+        #status { margin: 0.5rem 0; padding: 0.5rem; background: #f6f8fa; border-radius: 4px; font-size: 0.85rem; }
+        #compose { margin: 1rem 0; padding: 1rem; border: 1px solid #ddd; border-radius: 6px; }
+        #compose label { display: block; margin-bottom: 0.25rem; font-weight: bold; }
+        #title { width: 100%; box-sizing: border-box; padding: 0.4rem; font-family: monospace; margin-bottom: 0.5rem; }
+        #body { width: 100%; box-sizing: border-box; padding: 0.4rem; font-family: monospace; height: 6rem; margin-bottom: 0.5rem; }
+        #publish { padding: 0.4rem 1.2rem; font-family: monospace; cursor: pointer; }
+        #publish:disabled { opacity: 0.5; cursor: not-allowed; }
+        #posts { margin-top: 1rem; }
+        #posts article { border-top: 1px solid #eee; padding: 0.75rem 0; }
+        #posts article h2 { margin: 0 0 0.25rem 0; font-size: 1.1rem; }
+        #posts article p { margin: 0.25rem 0; }
+        #posts article .meta { font-size: 0.8rem; color: #888; }
     </style>
 </head>
 <body>
-    <h1>NEAR Git Storage - HTTP Server Test</h1>
-    <p>wasm-git &rarr; HTTP git server &rarr; NEAR sandbox</p>
+    <h1>NEAR Git Blog</h1>
+    <p>wasm-git &rarr; HTTP git server &rarr; NEAR blockchain</p>
     <div id="status">Initializing...</div>
 
-    <script type="module">
-        const GIT_SERVER_ORIGIN = location.origin;
-        const repoUrl = `${GIT_SERVER_ORIGIN}/repo`;
-        const statusEl = document.getElementById('status');
+    <div id="compose">
+        <label for="title">Title</label>
+        <input type="text" id="title" placeholder="Post title">
+        <label for="body">Body</label>
+        <textarea id="body" placeholder="Write your post..."></textarea>
+        <button id="publish" disabled>Publish</button>
+    </div>
 
-        function log(msg) {
-            statusEl.textContent += '\n' + msg;
-        }
+    <div id="posts"></div>
+
+    <script type="module">
+        const repoUrl = `${location.origin}/repo`;
+        const statusEl = document.getElementById('status');
+        const postsEl = document.getElementById('posts');
+        const titleEl = document.getElementById('title');
+        const bodyEl = document.getElementById('body');
+        const publishBtn = document.getElementById('publish');
+
+        function setStatus(msg) { statusEl.textContent = msg; }
 
         let worker, resolveNext;
         function createWorker() {
@@ -43,70 +65,104 @@
             } catch (e) {}
         }
 
-        async function main() {
-            statusEl.textContent = 'Starting...';
+        function renderMarkdown(md) {
+            const lines = md.split('\n');
+            let title = '';
+            const bodyLines = [];
+            let pastTitle = false;
+            for (const line of lines) {
+                if (!pastTitle && line.startsWith('# ')) {
+                    title = line.slice(2).trim();
+                    pastTitle = true;
+                } else if (pastTitle) {
+                    bodyLines.push(line);
+                }
+            }
+            const body = bodyLines.join('\n').trim();
+            const paragraphs = body.split(/\n\n+/).filter(Boolean);
+            return { title, paragraphs };
+        }
 
-            // Unregister any stale service workers from other tests
+        async function loadPosts() {
+            const listResult = await send('listfiles');
+            if (listResult.error) {
+                postsEl.innerHTML = '<p>No posts yet.</p>';
+                return;
+            }
+            const files = (listResult.files || []).sort().reverse().slice(0, 10);
+            if (files.length === 0) {
+                postsEl.innerHTML = '<p>No posts yet.</p>';
+                return;
+            }
+            let html = '';
+            for (const filename of files) {
+                const result = await send('readfile', { filename });
+                const content = result.filecontents || '';
+                const { title, paragraphs } = renderMarkdown(content);
+                const timestamp = filename.replace('.md', '');
+                html += `<article>
+                    <h2>${escapeHtml(title)}</h2>
+                    ${paragraphs.map(p => `<p>${escapeHtml(p)}</p>`).join('')}
+                    <div class="meta">${escapeHtml(timestamp)}</div>
+                </article>`;
+            }
+            postsEl.innerHTML = html;
+        }
+
+        function escapeHtml(s) {
+            return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        }
+
+        async function publish() {
+            const title = titleEl.value.trim();
+            const body = bodyEl.value.trim();
+            if (!title || !body) return;
+            publishBtn.disabled = true;
+            setStatus('Publishing...');
+            try {
+                const timestamp = new Date().toISOString().replace(/[:.]/g, m => m === ':' ? ':' : '.');
+                const filename = `${timestamp}.md`;
+                const contents = `# ${title}\n\n${body}`;
+                const result = await send('writecommitandpush', { filename, contents });
+                if (result.error) throw new Error(result.error);
+                titleEl.value = '';
+                bodyEl.value = '';
+                setStatus('Published! Refreshing...');
+                await loadPosts();
+                setStatus('Ready');
+            } catch (err) {
+                setStatus('Error: ' + err.message);
+            } finally {
+                publishBtn.disabled = false;
+            }
+        }
+
+        publishBtn.addEventListener('click', publish);
+
+        async function main() {
+            setStatus('Starting...');
+
+            // Unregister any stale service workers
             const regs = await navigator.serviceWorker.getRegistrations();
             for (const reg of regs) await reg.unregister();
 
             await clearOPFS('repo');
             createWorker();
             await next();
-            log('Worker ready');
 
-            // Clone empty repo
-            log('Cloning from NEAR git server...');
+            setStatus('Cloning repository...');
             const cloneResult = await send('clone', { url: repoUrl });
             if (cloneResult.error) throw new Error('Clone failed: ' + cloneResult.error);
-            log('Cloned: ' + JSON.stringify(cloneResult.dircontents));
 
-            // Write, commit, push
-            log('Writing file and pushing...');
-            const pushResult = await send('writecommitandpush', {
-                filename: 'hello.txt',
-                contents: 'Hello from wasm-git via NEAR blockchain!\n',
-            });
-            if (pushResult.error) throw new Error('Push failed: ' + pushResult.error);
-            log('Pushed successfully');
-
-            // Read back
-            log('Reading file...');
-            const readResult = await send('readfile', { filename: 'hello.txt' });
-            log('File contents: ' + (readResult.filecontents || '').trim());
-
-            // Delete local and re-clone to verify persistence
-            log('Deleting local copy...');
-            await send('deletelocal');
-
-            // Create a fresh worker and clear OPFS to ensure clean state
-            await clearOPFS('repo');
-            createWorker();
-            await next(); // wait for 'ready'
-
-            log('Re-cloning to verify blockchain persistence...');
-            const reClone = await send('clone', { url: repoUrl });
-            if (reClone.error) throw new Error('Re-clone failed: ' + reClone.error);
-            log('Re-cloned: ' + JSON.stringify(reClone.dircontents));
-
-            const verifyRead = await send('readfile', { filename: 'hello.txt' });
-            const content = (verifyRead.filecontents || '').trim();
-            log('Verified content: ' + content);
-
-            if (content !== 'Hello from wasm-git via NEAR blockchain!') {
-                throw new Error('Content mismatch after re-clone!');
-            }
-
-            statusEl.classList.add('success');
-            log('\nAll operations completed successfully!');
-            statusEl.id = 'demo-complete';
+            setStatus('Loading posts...');
+            await loadPosts();
+            publishBtn.disabled = false;
+            setStatus('Ready');
         }
 
         main().catch(err => {
             console.error(err);
-            statusEl.classList.add('error');
-            statusEl.textContent += '\nError: ' + err.message;
-            statusEl.id = 'demo-error';
+            setStatus('Error: ' + err.message);
         });
     </script>
 </body>

@@ -5,6 +5,7 @@
  *   clone              { url }                 → { dircontents }
  *   writecommitandpush { filename, contents }  → { dircontents }
  *   readfile           { filename }            → { filename, filecontents }
+ *   listfiles          {}                      → { files }
  *   deletelocal        {}                      → { deleted }
  */
 
@@ -69,8 +70,17 @@ onmessage = async (msg) => {
             } catch (e) {}
             const cloneRet = lg.callMain(['clone', msg.data.url, currentRepoDir]);
             if (cloneRet !== 0) {
-                postMessage({ error: `clone exited with code ${cloneRet}`, stdout, stderr });
-                return;
+                // Check if the directory was created (empty repo case)
+                let dirExists = false;
+                try {
+                    FS.readdir(currentRepoDir);
+                    dirExists = true;
+                } catch (e) {}
+                if (!dirExists) {
+                    postMessage({ error: `clone exited with code ${cloneRet}`, stdout, stderr });
+                    return;
+                }
+                // Directory exists — repo was cloned but is empty, treat as success
             }
             createMountPointSymlink(repoName);
             FS.chdir(currentRepoDir);
@@ -106,6 +116,12 @@ onmessage = async (msg) => {
                 filename: msg.data.filename,
                 filecontents: FS.readFile(msg.data.filename, { encoding: 'utf8' }),
             });
+
+        } else if (command === 'listfiles') {
+            FS.chdir(currentRepoDir);
+            const allEntries = FS.readdir('.').filter(e => e !== '.' && e !== '..');
+            const mdFiles = allEntries.filter(e => e.endsWith('.md'));
+            postMessage({ files: mdFiles, stdout, stderr });
 
         } else if (command === 'deletelocal') {
             const repoName = currentRepoDir ? currentRepoDir.split('/').pop() : null;
