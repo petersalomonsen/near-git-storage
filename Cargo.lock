@@ -977,6 +977,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "git-remote-near"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "git-core",
+ "near-api",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "git-server"
 version = "0.1.0"
 dependencies = [
