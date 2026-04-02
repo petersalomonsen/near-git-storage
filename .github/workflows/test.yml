@@ -12,7 +12,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@1.86.0
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Rust 1.86 for contract build
+        run: rustup toolchain install 1.86 --target wasm32-unknown-unknown
 
       - uses: actions/cache@v4
         with:
