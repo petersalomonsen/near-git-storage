@@ -1,12 +1,13 @@
-FROM rust:1.88-bookworm AS builder
+FROM rust:trixie AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    pkg-config libssl-dev && \
+    pkg-config libssl-dev curl && \
     rm -rf /var/lib/apt/lists/*
 
-# Install Rust 1.86 and cargo-near for contract build
-RUN rustup toolchain install 1.86 --target wasm32-unknown-unknown && \
-    cargo install cargo-near
+# Install cargo-near via pre-built binary and Rust 1.86 for contract build
+RUN curl --proto '=https' --tlsv1.2 -LsSf \
+    https://github.com/near/cargo-near/releases/download/cargo-near-v0.17.0/cargo-near-installer.sh | sh
+RUN rustup toolchain install 1.86 --target wasm32-unknown-unknown
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
