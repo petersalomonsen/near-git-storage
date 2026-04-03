@@ -4,6 +4,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config libssl-dev && \
     rm -rf /var/lib/apt/lists/*
 
+# Install Rust 1.86 and cargo-near for contract build
+RUN rustup toolchain install 1.86 --target wasm32-unknown-unknown && \
+    cargo install cargo-near
+
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
@@ -11,8 +15,9 @@ COPY git-core/ git-core/
 COPY git-server/ git-server/
 COPY git-remote-near/ git-remote-near/
 COPY wasm-lib/ wasm-lib/
-COPY res/ res/
+COPY build.sh ./
 
+RUN chmod +x build.sh && ./build.sh
 RUN cargo build -p git-server --release
 
 FROM ubuntu:24.04
