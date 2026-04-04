@@ -28,8 +28,7 @@ jobs:
 
       - name: Build contract
         run: |
-          sudo apt-get update && sudo apt-get install -y libudev-dev
-          cargo install cargo-near
+          curl --proto '=https' --tlsv1.2 -LsSf https://github.com/near/cargo-near/releases/download/cargo-near-v0.17.0/cargo-near-installer.sh | sh
           ./build.sh
 
       - uses: actions/setup-node@v4
