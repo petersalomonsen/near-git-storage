@@ -132,11 +132,12 @@ async fn main() {
         .route("/near-call", post(handle_near_call))
         .route("/near-info", get(handle_near_info))
         .route("/near-credentials", get(handle_near_credentials))
+        .route("/near-rpc", post(handle_near_rpc))
         .route("/parse-packfile", post(handle_parse_packfile))
         .layer(cors)
         .with_state(state);
 
-    let addr = "127.0.0.1:8080";
+    let addr = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
     info!("Git server listening on http://{}", addr);
     info!("Clone URL: http://{}/repo", addr);
     info!("");
@@ -750,6 +751,35 @@ async fn handle_near_call(
         }
         Err(e) => {
             axum::Json(json!({ "success": false, "error": e.to_string() })).into_response()
+        }
+    }
+}
+
+/// POST /near-rpc — proxy JSON-RPC requests to the sandbox's NEAR RPC
+async fn handle_near_rpc(
+    State(state): State<Arc<AppState>>,
+    body: Bytes,
+) -> Response {
+    let rpc_url = state.network.rpc_endpoints.first()
+        .map(|e| e.url.to_string())
+        .unwrap_or_default();
+
+    let client = reqwest::Client::new();
+    match client.post(&rpc_url)
+        .header("Content-Type", "application/json")
+        .body(body.to_vec())
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            let body_bytes = resp.bytes().await.unwrap_or_default();
+            let mut headers = HeaderMap::new();
+            headers.insert("Content-Type", HeaderValue::from_static("application/json"));
+            (status, headers, body_bytes.to_vec()).into_response()
+        }
+        Err(e) => {
+            (StatusCode::BAD_GATEWAY, format!("RPC proxy error: {}", e)).into_response()
         }
     }
 }

@@ -7,7 +7,7 @@ edition = "2021"
 git-core = { path = "../git-core" }
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
-near-sandbox = { version = "0.3", features = ["generate"] }
+near-sandbox = { version = "0.3", features = ["generate", "global_install"] }
 near-api = "0.8"
 near-token = "0.3"
 sha1 = "0.10"
@@ -17,3 +17,4 @@ serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 tower-http = { version = "0.6", features = ["cors"] }
+reqwest = "0.12"
