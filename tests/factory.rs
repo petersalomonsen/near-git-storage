@@ -258,3 +258,143 @@ async fn test_factory_get_global_contract() {
     let s = shared().await;
     assert_eq!(result, s.global_id.to_string());
 }
+
+#[tokio::test]
+async fn test_self_delete_by_owner() {
+    let s = shared().await;
+    let (factory_id, _factory_signer) = setup_factory().await;
+
+    // Create owner
+    let owner_secret = near_api::signer::generate_secret_key().unwrap();
+    let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let owner_id: AccountId = format!("delowner{n}.sandbox").parse().unwrap();
+
+    near_api::Account::create_account(owner_id.clone())
+        .fund_myself(s.genesis_id.clone(), NearToken::from_near(10))
+        .with_public_key(owner_secret.public_key())
+        .with_signer(s.genesis_signer.clone())
+        .send_to(&s.network)
+        .await
+        .unwrap()
+        .assert_success();
+
+    let owner_signer = Signer::from_secret_key(owner_secret).unwrap();
+
+    // Create repo
+    let repo_name = format!("delrepo{n}");
+    Contract(factory_id.clone())
+        .call_function("create_repo", json!({ "repo_name": repo_name }))
+        .transaction()
+        .deposit(NearToken::from_near(2))
+        .with_signer(owner_id.clone(), owner_signer.clone())
+        .send_to(&s.network)
+        .await
+        .unwrap()
+        .assert_success();
+
+    let repo_id: AccountId = format!("{}.{}", repo_name, factory_id).parse().unwrap();
+
+    // Verify repo exists
+    let owner: String = Contract(repo_id.clone())
+        .call_function("get_owner", json!({}))
+        .read_only::<String>()
+        .fetch_from(&s.network)
+        .await
+        .unwrap()
+        .data;
+    assert_eq!(owner, owner_id.to_string());
+
+    // Owner calls self_delete
+    Contract(repo_id.clone())
+        .call_function("self_delete", json!({}))
+        .transaction()
+        .with_signer(owner_id.clone(), owner_signer.clone())
+        .send_to(&s.network)
+        .await
+        .unwrap()
+        .assert_success();
+
+    // Verify repo account no longer exists (view call should fail)
+    let result = Contract(repo_id)
+        .call_function("get_owner", json!({}))
+        .read_only::<String>()
+        .fetch_from(&s.network)
+        .await;
+
+    assert!(result.is_err(), "Repo should no longer exist after self_delete");
+}
+
+#[tokio::test]
+async fn test_self_delete_rejected_for_non_owner() {
+    let s = shared().await;
+    let (factory_id, _factory_signer) = setup_factory().await;
+
+    // Create owner
+    let owner_secret = near_api::signer::generate_secret_key().unwrap();
+    let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let owner_id: AccountId = format!("owner{n}.sandbox").parse().unwrap();
+
+    near_api::Account::create_account(owner_id.clone())
+        .fund_myself(s.genesis_id.clone(), NearToken::from_near(10))
+        .with_public_key(owner_secret.public_key())
+        .with_signer(s.genesis_signer.clone())
+        .send_to(&s.network)
+        .await
+        .unwrap()
+        .assert_success();
+
+    let owner_signer = Signer::from_secret_key(owner_secret).unwrap();
+
+    // Create repo
+    let repo_name = format!("repo{n}");
+    Contract(factory_id.clone())
+        .call_function("create_repo", json!({ "repo_name": repo_name }))
+        .transaction()
+        .deposit(NearToken::from_near(2))
+        .with_signer(owner_id.clone(), owner_signer.clone())
+        .send_to(&s.network)
+        .await
+        .unwrap()
+        .assert_success();
+
+    let repo_id: AccountId = format!("{}.{}", repo_name, factory_id).parse().unwrap();
+
+    // Create a non-owner account
+    let non_owner_secret = near_api::signer::generate_secret_key().unwrap();
+    let non_owner_id: AccountId = format!("nonowner{n}.sandbox").parse().unwrap();
+
+    near_api::Account::create_account(non_owner_id.clone())
+        .fund_myself(s.genesis_id.clone(), NearToken::from_near(5))
+        .with_public_key(non_owner_secret.public_key())
+        .with_signer(s.genesis_signer.clone())
+        .send_to(&s.network)
+        .await
+        .unwrap()
+        .assert_success();
+
+    let non_owner_signer = Signer::from_secret_key(non_owner_secret).unwrap();
+
+    // Non-owner tries self_delete — should fail
+    let result = Contract(repo_id.clone())
+        .call_function("self_delete", json!({}))
+        .transaction()
+        .with_signer(non_owner_id, non_owner_signer)
+        .send_to(&s.network)
+        .await
+        .unwrap();
+
+    assert!(
+        result.is_failure(),
+        "Non-owner should not be able to delete the repo"
+    );
+
+    // Verify repo still exists
+    let owner: String = Contract(repo_id)
+        .call_function("get_owner", json!({}))
+        .read_only::<String>()
+        .fetch_from(&s.network)
+        .await
+        .unwrap()
+        .data;
+    assert_eq!(owner, owner_id.to_string());
+}

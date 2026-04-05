@@ -1,5 +1,5 @@
 use near_sdk::store::{IterableMap, LookupMap};
-use near_sdk::{env, near, AccountId, PanicOnDefault};
+use near_sdk::{env, near, AccountId, PanicOnDefault, Promise};
 use sha1::{Digest, Sha1};
 
 /// A git object SHA-1 hash as a 40-character hex string.
@@ -211,6 +211,13 @@ impl GitStorage {
     /// Return the contract owner.
     pub fn get_owner(&self) -> AccountId {
         self.owner.clone()
+    }
+
+    /// Delete this repo contract and send remaining funds to the owner.
+    /// Can only be called by the owner.
+    pub fn self_delete(&mut self) -> Promise {
+        self.assert_owner();
+        Promise::new(env::current_account_id()).delete_account(self.owner.clone())
     }
 }
 
