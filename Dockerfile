@@ -16,6 +16,7 @@ COPY git-core/ git-core/
 COPY git-server/ git-server/
 COPY git-remote-near/ git-remote-near/
 COPY wasm-lib/ wasm-lib/
+COPY factory/ factory/
 COPY build.sh ./
 
 RUN chmod +x build.sh && ./build.sh
@@ -29,6 +30,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /build/target/release/git-server /usr/local/bin/git-server
 COPY --from=builder /build/res/near_git_storage.wasm /app/res/near_git_storage.wasm
+COPY --from=builder /build/res/near_git_factory.wasm /app/res/near_git_factory.wasm
 
 # Download the near-sandbox binary to ~/.near/ where global_install expects it
 ARG NEAR_SANDBOX_VERSION=2.10.7
