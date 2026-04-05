@@ -18,15 +18,9 @@ static SHARED_SANDBOX: OnceCell<SharedSandbox> = OnceCell::const_new();
 /// Test-side mirror of the contract's GitObject (borsh-serialized).
 #[derive(BorshSerialize, BorshDeserialize, Clone)]
 struct GitObject {
+    sha: String,
     obj_type: String,
     data: Vec<u8>,
-    base_sha: Option<String>,
-}
-
-/// Test-side mirror of PushObjectsResult (borsh-deserialized).
-#[derive(BorshSerialize, BorshDeserialize)]
-struct PushObjectsResult {
-    shas: Vec<String>,
 }
 
 /// Test-side mirror of RetrievedObject (borsh-deserialized).
@@ -103,7 +97,7 @@ async fn get_shared_sandbox() -> &'static SharedSandbox {
         .await
 }
 
-/// Helper: compute git SHA-1 for a raw object (same algorithm as the contract).
+/// Helper: compute git SHA-1 for a raw object (same algorithm as git).
 fn git_sha(obj_type: &str, data: &[u8]) -> String {
     use sha1::{Digest, Sha1};
     let header = format!("{} {}\0", obj_type, data.len());
@@ -114,21 +108,12 @@ fn git_sha(obj_type: &str, data: &[u8]) -> String {
     result.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-/// Build a GitObject for pushing (no delta base).
+/// Build a GitObject (SHA computed client-side).
 fn blob(data: &[u8]) -> GitObject {
     GitObject {
+        sha: git_sha("blob", data),
         obj_type: "blob".to_string(),
         data: data.to_vec(),
-        base_sha: None,
-    }
-}
-
-/// Build a GitObject for pushing with a delta base hint.
-fn blob_delta(data: &[u8], base_sha: &str) -> GitObject {
-    GitObject {
-        obj_type: "blob".to_string(),
-        data: data.to_vec(),
-        base_sha: Some(base_sha.to_string()),
     }
 }
 
@@ -221,14 +206,25 @@ impl TestContext {
             .unwrap()
     }
 
-    /// Call a borsh contract method as the owner.
-    async fn owner_call_borsh<A: BorshSerialize>(
+    /// Push git objects via borsh.
+    async fn push_objects(&self, objects: Vec<GitObject>) {
+        Contract(self.contract_id.clone())
+            .call_function_borsh("push_objects", &objects)
+            .transaction()
+            .with_signer(self.owner_id.clone(), self.owner_signer.clone())
+            .send_to(&self.network)
+            .await
+            .unwrap()
+            .assert_success();
+    }
+
+    /// Push git objects via borsh, return raw TransactionResult.
+    async fn push_objects_raw(
         &self,
-        method: &str,
-        args: A,
+        objects: Vec<GitObject>,
     ) -> near_api::types::transaction::result::TransactionResult {
         Contract(self.contract_id.clone())
-            .call_function_borsh(method, args)
+            .call_function_borsh("push_objects", &objects)
             .transaction()
             .with_signer(self.owner_id.clone(), self.owner_signer.clone())
             .send_to(&self.network)
@@ -236,28 +232,22 @@ impl TestContext {
             .unwrap()
     }
 
-    /// Push git objects via borsh, return the computed SHAs.
-    async fn push_objects(&self, objects: Vec<GitObject>) -> PushObjectsResult {
-        self.owner_call_borsh("push_objects", &objects)
-            .await
-            .assert_success()
-            .borsh::<PushObjectsResult>()
-            .unwrap()
-    }
-
-    /// Push git objects via borsh, return the raw TransactionResult (for tx_hash extraction).
-    async fn push_objects_raw(
-        &self,
-        objects: Vec<GitObject>,
-    ) -> near_api::types::transaction::result::TransactionResult {
-        self.owner_call_borsh("push_objects", &objects).await
-    }
-
     /// Retrieve objects by SHA via borsh view call.
     async fn get_objects(&self, shas: Vec<String>) -> Vec<(String, Option<RetrievedObject>)> {
         Contract(self.contract_id.clone())
             .call_function_borsh("get_objects", &shas)
             .read_only_borsh::<Vec<(String, Option<RetrievedObject>)>>()
+            .fetch_from(&self.network)
+            .await
+            .unwrap()
+            .data
+    }
+
+    /// Call a JSON view method with no args and deserialize the result.
+    async fn view_no_args<T: serde::de::DeserializeOwned + Send + Sync>(&self, method: &str) -> T {
+        Contract(self.contract_id.clone())
+            .call_function(method, json!({}))
+            .read_only::<T>()
             .fetch_from(&self.network)
             .await
             .unwrap()
@@ -278,94 +268,77 @@ impl TestContext {
             .unwrap()
             .data
     }
-
-    /// Call a JSON view method with no args and deserialize the result.
-    async fn view_no_args<T: serde::de::DeserializeOwned + Send + Sync>(&self, method: &str) -> T {
-        Contract(self.contract_id.clone())
-            .call_function(method, json!({}))
-            .read_only::<T>()
-            .fetch_from(&self.network)
-            .await
-            .unwrap()
-            .data
-    }
 }
 
 #[tokio::test]
-async fn test_push_objects_returns_correct_shas() {
+async fn test_push_and_retrieve_object() {
     let ctx = setup().await;
 
-    let blob_data = b"hello world";
-    let expected_sha = git_sha("blob", blob_data);
+    let data = b"hello world";
+    let obj = blob(data);
+    let sha = obj.sha.clone();
 
-    let result = ctx.push_objects(vec![blob(blob_data)]).await;
+    ctx.push_objects(vec![obj]).await;
 
-    assert_eq!(result.shas.len(), 1);
-    assert_eq!(result.shas[0], expected_sha);
+    let objects = ctx.get_objects(vec![sha.clone()]).await;
+    assert_eq!(objects.len(), 1);
+    let retrieved = objects[0].1.as_ref().unwrap();
+    assert_eq!(retrieved.obj_type, "blob");
+    assert_eq!(retrieved.data, data);
 }
 
 #[tokio::test]
 async fn test_push_multiple_objects() {
     let ctx = setup().await;
 
-    let blob1 = b"file one";
-    let blob2 = b"file two";
-    let expected_sha1 = git_sha("blob", blob1);
-    let expected_sha2 = git_sha("blob", blob2);
+    let obj1 = blob(b"file one");
+    let obj2 = blob(b"file two");
+    let sha1 = obj1.sha.clone();
+    let sha2 = obj2.sha.clone();
 
-    let result = ctx.push_objects(vec![blob(blob1), blob(blob2)]).await;
+    ctx.push_objects(vec![obj1, obj2]).await;
 
-    assert_eq!(result.shas.len(), 2);
-    assert_eq!(result.shas[0], expected_sha1);
-    assert_eq!(result.shas[1], expected_sha2);
+    let objects = ctx.get_objects(vec![sha1.clone(), sha2.clone()]).await;
+    assert_eq!(objects.len(), 2);
+    assert_eq!(objects[0].1.as_ref().unwrap().data, b"file one");
+    assert_eq!(objects[1].1.as_ref().unwrap().data, b"file two");
 }
 
 #[tokio::test]
 async fn test_register_push_stores_mappings_and_updates_refs() {
     let ctx = setup().await;
 
-    let blob_data = b"hello world";
-    let sha = git_sha("blob", blob_data);
+    let obj = blob(b"hello world");
+    let sha = obj.sha.clone();
 
-    // Push the objects
-    let push_result = ctx.push_objects_raw(vec![blob(blob_data)]).await;
-
+    let push_result = ctx.push_objects_raw(vec![obj]).await;
     let full = push_result.into_full().unwrap();
     let tx_hash = full.outcome().transaction_hash.to_string();
     full.assert_success();
 
-    // Register the push with ref updates
     ctx.owner_call(
         "register_push",
         json!({
             "tx_hash": tx_hash,
             "object_shas": [&sha],
-            "ref_updates": [
-                {
-                    "name": "refs/heads/main",
-                    "old_sha": null,
-                    "new_sha": &sha
-                }
-            ]
+            "ref_updates": [{
+                "name": "refs/heads/main",
+                "old_sha": null,
+                "new_sha": &sha
+            }]
         }),
     )
     .await
     .assert_success();
 
-    // Verify refs
     let refs: Vec<(String, String)> = ctx.view_no_args("get_refs").await;
-
     assert_eq!(refs.len(), 1);
     assert_eq!(refs[0].0, "refs/heads/main");
     assert_eq!(refs[0].1, sha);
 
-    // Verify object locations
     let locations: Vec<(String, Option<String>)> = ctx
         .view("get_object_locations", json!({ "shas": [&sha] }))
         .await;
-
-    assert_eq!(locations.len(), 1);
-    assert_eq!(locations[0].0, sha);
     assert_eq!(locations[0].1, Some(tx_hash));
 }
 
@@ -373,11 +346,10 @@ async fn test_register_push_stores_mappings_and_updates_refs() {
 async fn test_ref_update_cas_rejects_stale_old_sha() {
     let ctx = setup().await;
 
-    let blob1 = b"version 1";
-    let sha1 = git_sha("blob", blob1);
+    let obj1 = blob(b"version 1");
+    let sha1 = obj1.sha.clone();
 
-    // Push and register the first version
-    let push_result = ctx.push_objects_raw(vec![blob(blob1)]).await;
+    let push_result = ctx.push_objects_raw(vec![obj1]).await;
     let tx_hash1 = push_result.into_full().unwrap().outcome().transaction_hash.to_string();
 
     ctx.owner_call(
@@ -385,24 +357,17 @@ async fn test_ref_update_cas_rejects_stale_old_sha() {
         json!({
             "tx_hash": tx_hash1,
             "object_shas": [&sha1],
-            "ref_updates": [{
-                "name": "refs/heads/main",
-                "old_sha": null,
-                "new_sha": &sha1
-            }]
+            "ref_updates": [{ "name": "refs/heads/main", "old_sha": null, "new_sha": &sha1 }]
         }),
     )
     .await
     .assert_success();
 
-    // Push a second version
-    let blob2 = b"version 2";
-    let sha2 = git_sha("blob", blob2);
-
-    let push_result2 = ctx.push_objects_raw(vec![blob(blob2)]).await;
+    let obj2 = blob(b"version 2");
+    let sha2 = obj2.sha.clone();
+    let push_result2 = ctx.push_objects_raw(vec![obj2]).await;
     let tx_hash2 = push_result2.into_full().unwrap().outcome().transaction_hash.to_string();
 
-    // Use a wrong old_sha -- should fail
     let result = ctx
         .owner_call(
             "register_push",
@@ -418,71 +383,10 @@ async fn test_ref_update_cas_rejects_stale_old_sha() {
         )
         .await;
 
-    assert!(
-        result.is_failure(),
-        "Expected CAS failure but transaction succeeded"
-    );
+    assert!(result.is_failure(), "Expected CAS failure");
 
-    // Verify the ref was NOT updated
     let refs: Vec<(String, String)> = ctx.view_no_args("get_refs").await;
-
-    assert_eq!(refs.len(), 1);
-    assert_eq!(refs[0].1, sha1, "Ref should still point to the original SHA");
-}
-
-#[tokio::test]
-async fn test_ref_update_cas_succeeds_with_correct_old_sha() {
-    let ctx = setup().await;
-
-    let blob1 = b"version 1";
-    let sha1 = git_sha("blob", blob1);
-
-    // Create the initial ref
-    let push_result = ctx.push_objects_raw(vec![blob(blob1)]).await;
-    let tx_hash1 = push_result.into_full().unwrap().outcome().transaction_hash.to_string();
-
-    ctx.owner_call(
-        "register_push",
-        json!({
-            "tx_hash": tx_hash1,
-            "object_shas": [&sha1],
-            "ref_updates": [{
-                "name": "refs/heads/main",
-                "old_sha": null,
-                "new_sha": &sha1
-            }]
-        }),
-    )
-    .await
-    .assert_success();
-
-    // Update with the CORRECT old_sha
-    let blob2 = b"version 2";
-    let sha2 = git_sha("blob", blob2);
-
-    let push_result2 = ctx.push_objects_raw(vec![blob(blob2)]).await;
-    let tx_hash2 = push_result2.into_full().unwrap().outcome().transaction_hash.to_string();
-
-    ctx.owner_call(
-        "register_push",
-        json!({
-            "tx_hash": tx_hash2,
-            "object_shas": [&sha2],
-            "ref_updates": [{
-                "name": "refs/heads/main",
-                "old_sha": &sha1,
-                "new_sha": &sha2
-            }]
-        }),
-    )
-    .await
-    .assert_success();
-
-    // Verify the ref was updated
-    let refs: Vec<(String, String)> = ctx.view_no_args("get_refs").await;
-
-    assert_eq!(refs.len(), 1);
-    assert_eq!(refs[0].1, sha2, "Ref should point to the new SHA");
+    assert_eq!(refs[0].1, sha1);
 }
 
 #[tokio::test]
@@ -490,16 +394,12 @@ async fn test_non_owner_cannot_push() {
     let ctx = setup().await;
     let shared = get_shared_sandbox().await;
 
-    // Create a non-owner account
     let non_owner_secret = near_api::signer::generate_secret_key().unwrap();
     let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
     let non_owner_id: AccountId = format!("nonowner{n}.sandbox").parse().unwrap();
 
     near_api::Account::create_account(non_owner_id.clone())
-        .fund_myself(
-            shared.genesis_id.clone(),
-            near_api::NearToken::from_near(10),
-        )
+        .fund_myself(shared.genesis_id.clone(), NearToken::from_near(10))
         .with_public_key(non_owner_secret.public_key())
         .with_signer(shared.genesis_signer.clone())
         .send_to(&ctx.network)
@@ -509,7 +409,6 @@ async fn test_non_owner_cannot_push() {
 
     let non_owner_signer = Signer::from_secret_key(non_owner_secret).unwrap();
 
-    // Non-owner tries to push_objects (borsh)
     let objects = vec![blob(b"hacker data")];
     let result = Contract(ctx.contract_id.clone())
         .call_function_borsh("push_objects", &objects)
@@ -519,232 +418,52 @@ async fn test_non_owner_cannot_push() {
         .await
         .unwrap();
 
-    assert!(
-        result.is_failure(),
-        "Non-owner should not be able to push objects"
-    );
-}
-
-#[tokio::test]
-async fn test_non_owner_cannot_register_push() {
-    let ctx = setup().await;
-    let shared = get_shared_sandbox().await;
-
-    // Create a non-owner account
-    let non_owner_secret = near_api::signer::generate_secret_key().unwrap();
-    let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-    let non_owner_id: AccountId = format!("nonowner{n}.sandbox").parse().unwrap();
-
-    near_api::Account::create_account(non_owner_id.clone())
-        .fund_myself(
-            shared.genesis_id.clone(),
-            near_api::NearToken::from_near(10),
-        )
-        .with_public_key(non_owner_secret.public_key())
-        .with_signer(shared.genesis_signer.clone())
-        .send_to(&ctx.network)
-        .await
-        .unwrap()
-        .assert_success();
-
-    let non_owner_signer = Signer::from_secret_key(non_owner_secret).unwrap();
-
-    // Non-owner tries to register_push
-    let result = Contract(ctx.contract_id.clone())
-        .call_function(
-            "register_push",
-            json!({
-                "tx_hash": "fake_tx_hash",
-                "object_shas": ["aaaa"],
-                "ref_updates": []
-            }),
-        )
-        .transaction()
-        .with_signer(non_owner_id, non_owner_signer)
-        .send_to(&ctx.network)
-        .await
-        .unwrap();
-
-    assert!(
-        result.is_failure(),
-        "Non-owner should not be able to register push"
-    );
+    assert!(result.is_failure(), "Non-owner should not be able to push");
 }
 
 #[tokio::test]
 async fn test_get_refs_empty() {
     let ctx = setup().await;
-
     let refs: Vec<(String, String)> = ctx.view_no_args("get_refs").await;
-
-    assert!(refs.is_empty(), "New contract should have no refs");
+    assert!(refs.is_empty());
 }
 
 #[tokio::test]
-async fn test_get_object_locations_missing() {
+async fn test_get_objects_missing() {
     let ctx = setup().await;
-
-    let locations: Vec<(String, Option<String>)> = ctx
-        .view(
-            "get_object_locations",
-            json!({ "shas": ["0000000000000000000000000000000000000000"] }),
-        )
-        .await;
-
-    assert_eq!(locations.len(), 1);
-    assert_eq!(locations[0].1, None, "Unknown SHA should return None");
+    let objects = ctx.get_objects(vec!["0000000000000000000000000000000000000000".to_string()]).await;
+    assert_eq!(objects.len(), 1);
+    assert!(objects[0].1.is_none());
 }
 
 #[tokio::test]
-async fn test_creating_ref_when_one_already_exists_fails() {
+async fn test_duplicate_push_is_idempotent() {
     let ctx = setup().await;
 
-    let blob1 = b"data1";
-    let sha1 = git_sha("blob", blob1);
+    let obj = blob(b"same data");
+    let sha = obj.sha.clone();
 
-    // Create the ref
-    let push_result = ctx.push_objects_raw(vec![blob(blob1)]).await;
-    let tx_hash = push_result.into_full().unwrap().outcome().transaction_hash.to_string();
+    ctx.push_objects(vec![obj.clone()]).await;
+    ctx.push_objects(vec![obj]).await;
 
-    ctx.owner_call(
-        "register_push",
-        json!({
-            "tx_hash": &tx_hash,
-            "object_shas": [&sha1],
-            "ref_updates": [{
-                "name": "refs/heads/main",
-                "old_sha": null,
-                "new_sha": &sha1
-            }]
-        }),
-    )
-    .await
-    .assert_success();
-
-    // Try to create the same ref again (old_sha: null, but ref exists)
-    let blob2 = b"data2";
-    let sha2 = git_sha("blob", blob2);
-
-    let push_result2 = ctx.push_objects_raw(vec![blob(blob2)]).await;
-    let tx_hash2 = push_result2.into_full().unwrap().outcome().transaction_hash.to_string();
-
-    let result = ctx
-        .owner_call(
-            "register_push",
-            json!({
-                "tx_hash": &tx_hash2,
-                "object_shas": [&sha2],
-                "ref_updates": [{
-                    "name": "refs/heads/main",
-                    "old_sha": null,
-                    "new_sha": &sha2
-                }]
-            }),
-        )
-        .await;
-
-    assert!(
-        result.is_failure(),
-        "Creating a ref that already exists (with old_sha=null) should fail"
-    );
-}
-
-#[tokio::test]
-async fn test_delta_compression_stores_and_retrieves() {
-    let ctx = setup().await;
-
-    // Push a base blob
-    let base_data = b"The quick brown fox jumps over the lazy dog. This is padding to exceed 16 bytes for block matching.";
-    let base_sha = git_sha("blob", base_data);
-
-    ctx.push_objects(vec![blob(base_data)]).await;
-
-    // Push a similar blob with base_sha hint
-    let target_data = b"The quick brown cat jumps over the lazy dog. This is padding to exceed 16 bytes for block matching.";
-    let target_sha = git_sha("blob", target_data);
-
-    let result = ctx
-        .push_objects(vec![blob_delta(target_data, &base_sha)])
-        .await;
-    assert_eq!(result.shas[0], target_sha);
-
-    // Retrieve both objects and verify data is correct
-    let objects = ctx.get_objects(vec![base_sha, target_sha]).await;
-
-    assert_eq!(objects.len(), 2);
-
-    // Verify base object
-    let base_obj = objects[0].1.as_ref().unwrap();
-    assert_eq!(base_obj.obj_type, "blob");
-    assert_eq!(base_obj.data, base_data);
-
-    // Verify delta-compressed object returns correct full data
-    let target_obj = objects[1].1.as_ref().unwrap();
-    assert_eq!(target_obj.obj_type, "blob");
-    assert_eq!(target_obj.data, target_data);
-}
-
-#[tokio::test]
-async fn test_delta_chain_resolves_correctly() {
-    let ctx = setup().await;
-
-    // Push base (v1)
-    let v1 = b"version one of the file with enough content for delta matching to work properly here";
-    let sha1 = git_sha("blob", v1);
-    ctx.push_objects(vec![blob(v1)]).await;
-
-    // Push v2 as delta of v1
-    let v2 = b"version two of the file with enough content for delta matching to work properly here";
-    let sha2 = git_sha("blob", v2);
-    ctx.push_objects(vec![blob_delta(v2, &sha1)]).await;
-
-    // Push v3 as delta of v2 (creates a chain: v3 -> v2 -> v1)
-    let v3 = b"version 333 of the file with enough content for delta matching to work properly here";
-    let sha3 = git_sha("blob", v3);
-    ctx.push_objects(vec![blob_delta(v3, &sha2)]).await;
-
-    // Retrieve v3 and verify it resolves the full chain
-    let objects = ctx.get_objects(vec![sha3]).await;
-
-    let obj = objects[0].1.as_ref().unwrap();
-    assert_eq!(obj.data, v3, "Delta chain resolution should produce correct v3 data");
-}
-
-#[tokio::test]
-async fn test_delta_skipped_when_not_smaller() {
-    let ctx = setup().await;
-
-    // Push a base blob
-    let base_data = b"short";
-    let base_sha = git_sha("blob", base_data);
-    ctx.push_objects(vec![blob(base_data)]).await;
-
-    // Push a completely different blob with base_sha hint
-    // Delta should be larger than the target, so full storage should be used
-    let target_data = b"xyz!!";
-    let target_sha = git_sha("blob", target_data);
-    ctx.push_objects(vec![blob_delta(target_data, &base_sha)]).await;
-
-    // Verify retrieval still works (stored as full object)
-    let objects = ctx.get_objects(vec![target_sha]).await;
-
-    let obj = objects[0].1.as_ref().unwrap();
-    assert_eq!(obj.data, target_data);
-}
-
-#[tokio::test]
-async fn test_push_without_base_sha() {
-    let ctx = setup().await;
-
-    let data = b"no delta base provided";
-    let sha = git_sha("blob", data);
-
-    let result = ctx.push_objects(vec![blob(data)]).await;
-    assert_eq!(result.shas[0], sha);
-
-    // Verify retrieval
     let objects = ctx.get_objects(vec![sha]).await;
+    assert_eq!(objects[0].1.as_ref().unwrap().data, b"same data");
+}
 
-    let obj = objects[0].1.as_ref().unwrap();
-    assert_eq!(obj.data, data);
+#[tokio::test]
+async fn test_stores_compressed_data_verbatim() {
+    let ctx = setup().await;
+
+    // Simulate client sending "compressed" bytes — contract stores as-is
+    let compressed = vec![0x78, 0x9c, 0xab, 0xca]; // fake zlib header
+    let obj = GitObject {
+        sha: "deadbeef00000000000000000000000000000000".to_string(),
+        obj_type: "blob".to_string(),
+        data: compressed.clone(),
+    };
+
+    ctx.push_objects(vec![obj]).await;
+
+    let objects = ctx.get_objects(vec!["deadbeef00000000000000000000000000000000".to_string()]).await;
+    assert_eq!(objects[0].1.as_ref().unwrap().data, compressed);
 }

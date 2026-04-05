@@ -163,14 +163,14 @@ async fn test_factory_create_repo() {
     // Verify the repo is functional — push objects as the owner (borsh-serialized)
     #[derive(borsh::BorshSerialize)]
     struct GitObject {
+        sha: String,
         obj_type: String,
         data: Vec<u8>,
-        base_sha: Option<String>,
     }
     let objects = vec![GitObject {
+        sha: "deadbeef00000000000000000000000000000000".to_string(),
         obj_type: "blob".to_string(),
         data: b"hello from factory repo".to_vec(),
-        base_sha: None,
     }];
     let result = Contract(repo_id.clone())
         .call_function_borsh("push_objects", &objects)

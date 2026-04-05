@@ -23,15 +23,9 @@ use tracing::{error, info};
 /// Borsh-serialized git object for push_objects calls.
 #[derive(BorshSerialize)]
 struct GitObject {
+    sha: String,
     obj_type: String,
     data: Vec<u8>,
-    base_sha: Option<String>,
-}
-
-/// Borsh-deserialized push_objects result.
-#[derive(BorshDeserialize)]
-struct PushObjectsResult {
-    shas: Vec<String>,
 }
 
 /// Borsh-deserialized object from get_objects.
@@ -363,7 +357,7 @@ async fn handle_receive_pack(
                             .data;
 
                     result.into_iter().next().and_then(|(_, v)| {
-                        v.map(|obj| (obj.obj_type, obj.data))
+                        v.map(|obj| (obj.obj_type, packfile::zlib_decompress(&obj.data)))
                     })
                 };
 
@@ -405,9 +399,9 @@ async fn handle_receive_pack(
         let git_objects: Vec<GitObject> = pack_objects
             .iter()
             .map(|obj| GitObject {
+                sha: obj.sha1(),
                 obj_type: obj.obj_type.clone(),
-                data: obj.data.clone(),
-                base_sha: None,
+                data: packfile::zlib_compress(&obj.data),
             })
             .collect();
 
@@ -436,15 +430,7 @@ async fn handle_receive_pack(
 
         let tx_hash = full.outcome().transaction_hash.to_string();
 
-        let push_data: PushObjectsResult = match full.borsh() {
-            Ok(v) => v,
-            Err(e) => {
-                error!("push_objects failed: {}", e);
-                return make_receive_pack_response(&[format!("ng unpack {}", e)]);
-            }
-        };
-
-        object_shas = push_data.shas;
+        object_shas = git_objects.iter().map(|o| o.sha.clone()).collect();
 
         info!("  pushed {} objects, tx={}", object_shas.len(), tx_hash);
 
@@ -594,77 +580,24 @@ async fn handle_upload_pack(
         return (StatusCode::OK, headers, body).into_response();
     }
 
-    // Walk the object graph from wants, stopping at haves
+    // Get all SHAs from contract, filter out haves
+    let all_shas: Vec<String> = Contract(state.contract_id.clone())
+        .call_function("get_all_shas", json!({}))
+        .read_only()
+        .fetch_from(&state.network)
+        .await
+        .unwrap()
+        .data;
+
     let haves_set: std::collections::HashSet<String> = haves.into_iter().collect();
-    let mut needed: Vec<String> = Vec::new();
-    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut queue: std::collections::VecDeque<String> = wants.into_iter().collect();
+    let needed: Vec<String> = all_shas
+        .into_iter()
+        .filter(|sha| !haves_set.contains(sha))
+        .collect();
 
-    while let Some(sha) = queue.pop_front() {
-        if visited.contains(&sha) || haves_set.contains(&sha) {
-            continue;
-        }
-        visited.insert(sha.clone());
-        needed.push(sha.clone());
+    info!("  need {} objects", needed.len());
 
-        // Fetch this object to find children (borsh)
-        let shas_query = vec![sha.clone()];
-        let objects: Vec<(String, Option<RetrievedObject>)> =
-            Contract(state.contract_id.clone())
-                .call_function_borsh("get_objects", &shas_query)
-                .read_only_borsh()
-                .fetch_from(&state.network)
-                .await
-                .unwrap()
-                .data;
-
-        for (_sha, maybe_obj) in objects {
-            if let Some(obj) = maybe_obj {
-                match obj.obj_type.as_str() {
-                    "commit" => {
-                        let text = String::from_utf8_lossy(&obj.data);
-                        for line in text.lines() {
-                            if let Some(tree_sha) = line.strip_prefix("tree ") {
-                                queue.push_back(tree_sha.trim().to_string());
-                            } else if let Some(parent_sha) = line.strip_prefix("parent ") {
-                                queue.push_back(parent_sha.trim().to_string());
-                            } else if line.is_empty() {
-                                break;
-                            }
-                        }
-                    }
-                    "tree" => {
-                        let mut pos = 0;
-                        while pos < obj.data.len() {
-                            let null_pos = obj.data[pos..]
-                                .iter()
-                                .position(|&b| b == 0)
-                                .map(|p| pos + p);
-                            if let Some(null_pos) = null_pos {
-                                if null_pos + 21 <= obj.data.len() {
-                                    let child_sha: String = obj.data[null_pos + 1..null_pos + 21]
-                                        .iter()
-                                        .map(|b| format!("{:02x}", b))
-                                        .collect();
-                                    queue.push_back(child_sha);
-                                    pos = null_pos + 21;
-                                } else {
-                                    break;
-                                }
-                            } else {
-                                break;
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    info!("  need {} objects total", needed.len());
-
-    // Fetch all needed objects in batches (borsh)
+    // Fetch needed objects in batches, decompress each
     let mut pack_objects = Vec::new();
 
     for chunk in needed.chunks(50) {
@@ -682,7 +615,7 @@ async fn handle_upload_pack(
             if let Some(obj) = maybe_obj {
                 pack_objects.push(packfile::PackObject {
                     obj_type: obj.obj_type,
-                    data: obj.data,
+                    data: packfile::zlib_decompress(&obj.data),
                 });
             }
         }
@@ -770,9 +703,9 @@ async fn handle_near_call(
                             .decode(data_b64)
                             .unwrap_or_default();
                         GitObject {
+                            sha: obj["sha"].as_str().unwrap_or("").to_string(),
                             obj_type: obj["obj_type"].as_str().unwrap_or("blob").to_string(),
                             data,
-                            base_sha: obj["base_sha"].as_str().map(String::from),
                         }
                     })
                     .collect()
@@ -790,11 +723,10 @@ async fn handle_near_call(
             Ok(r) => {
                 let tx_hash = r.transaction().get_hash().to_string();
                 if r.is_success() {
-                    let full = r.into_full().unwrap();
-                    let data: PushObjectsResult = full.borsh().unwrap();
+                    let shas: Vec<String> = git_objects.iter().map(|o| o.sha.clone()).collect();
                     axum::Json(json!({
                         "success": true,
-                        "result": { "shas": data.shas },
+                        "result": { "shas": shas },
                         "txHash": tx_hash,
                     }))
                     .into_response()

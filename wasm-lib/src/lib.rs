@@ -64,6 +64,18 @@ pub fn apply_delta(source: &[u8], delta: &[u8]) -> Result<Vec<u8>, String> {
     git_core::packfile::apply_delta(source, delta)
 }
 
+/// Zlib-decompress data.
+#[wasm_bindgen]
+pub fn zlib_decompress(data: &[u8]) -> Vec<u8> {
+    git_core::packfile::zlib_decompress(data)
+}
+
+/// Zlib-compress data.
+#[wasm_bindgen]
+pub fn zlib_compress(data: &[u8]) -> Vec<u8> {
+    git_core::packfile::zlib_compress(data)
+}
+
 /// Compute the git SHA-1 hash for an object.
 #[wasm_bindgen]
 pub fn git_sha1(obj_type: &str, data: &[u8]) -> String {
@@ -78,7 +90,7 @@ pub fn git_sha1(obj_type: &str, data: &[u8]) -> String {
 
 /// Borsh-encode git objects for push_objects (JSON input with base64 data → borsh bytes).
 ///
-/// Input: JSON array of `[{obj_type, data(base64), base_sha?}, ...]`
+/// Input: JSON array of `[{sha, obj_type, data(base64)}, ...]`
 /// Output: borsh-encoded `Vec<GitObject>` bytes
 #[wasm_bindgen]
 pub fn borsh_encode_push_objects(objects_json: &str) -> Result<Vec<u8>, String> {
@@ -89,6 +101,8 @@ pub fn borsh_encode_push_objects(objects_json: &str) -> Result<Vec<u8>, String> 
     // Vec length
     buf.extend_from_slice(&(objects.len() as u32).to_le_bytes());
     for obj in &objects {
+        // sha: String
+        borsh_write_string(&mut buf, obj["sha"].as_str().unwrap_or(""));
         // obj_type: String
         borsh_write_string(&mut buf, obj["obj_type"].as_str().unwrap_or("blob"));
         // data: Vec<u8> (decode from base64)
@@ -98,14 +112,6 @@ pub fn borsh_encode_push_objects(objects_json: &str) -> Result<Vec<u8>, String> 
             .unwrap_or_default();
         buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
         buf.extend_from_slice(&data);
-        // base_sha: Option<String>
-        match obj.get("base_sha").and_then(|v| v.as_str()) {
-            Some(sha) => {
-                buf.push(1);
-                borsh_write_string(&mut buf, sha);
-            }
-            None => buf.push(0),
-        }
     }
     Ok(buf)
 }
@@ -123,14 +129,6 @@ pub fn borsh_encode_shas(shas_json: &str) -> Result<Vec<u8>, String> {
         borsh_write_string(&mut buf, sha);
     }
     Ok(buf)
-}
-
-/// Decode borsh PushObjectsResult → JSON string `{"shas":["..."]}`
-#[wasm_bindgen]
-pub fn borsh_decode_push_result(data: &[u8]) -> Result<String, String> {
-    let mut pos = 0;
-    let shas = borsh_read_string_vec(data, &mut pos)?;
-    serde_json::to_string(&serde_json::json!({ "shas": shas })).map_err(|e| e.to_string())
 }
 
 /// Decode borsh get_objects result → JSON string

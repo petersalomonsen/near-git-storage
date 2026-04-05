@@ -48,35 +48,9 @@ export function borsh_decode_objects(data) {
 }
 
 /**
- * Decode borsh PushObjectsResult → JSON string `{"shas":["..."]}`
- * @param {Uint8Array} data
- * @returns {string}
- */
-export function borsh_decode_push_result(data) {
-    let deferred3_0;
-    let deferred3_1;
-    try {
-        const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
-        const len0 = WASM_VECTOR_LEN;
-        const ret = wasm.borsh_decode_push_result(ptr0, len0);
-        var ptr2 = ret[0];
-        var len2 = ret[1];
-        if (ret[3]) {
-            ptr2 = 0; len2 = 0;
-            throw takeFromExternrefTable0(ret[2]);
-        }
-        deferred3_0 = ptr2;
-        deferred3_1 = len2;
-        return getStringFromWasm0(ptr2, len2);
-    } finally {
-        wasm.__wbindgen_free(deferred3_0, deferred3_1, 1);
-    }
-}
-
-/**
  * Borsh-encode git objects for push_objects (JSON input with base64 data → borsh bytes).
  *
- * Input: JSON array of `[{obj_type, data(base64), base_sha?}, ...]`
+ * Input: JSON array of `[{sha, obj_type, data(base64)}, ...]`
  * Output: borsh-encoded `Vec<GitObject>` bytes
  * @param {string} objects_json
  * @returns {Uint8Array}
@@ -237,6 +211,34 @@ export function parse_packfile(data) {
     } finally {
         wasm.__wbindgen_free(deferred3_0, deferred3_1, 1);
     }
+}
+
+/**
+ * Zlib-compress data.
+ * @param {Uint8Array} data
+ * @returns {Uint8Array}
+ */
+export function zlib_compress(data) {
+    const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.zlib_compress(ptr0, len0);
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * Zlib-decompress data.
+ * @param {Uint8Array} data
+ * @returns {Uint8Array}
+ */
+export function zlib_decompress(data) {
+    const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.zlib_decompress(ptr0, len0);
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
 }
 
 function __wbg_get_imports() {

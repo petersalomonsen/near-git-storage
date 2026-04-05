@@ -17,8 +17,9 @@ import init, {
     create_signed_transaction,
     borsh_encode_push_objects,
     borsh_encode_shas,
-    borsh_decode_push_result,
     borsh_decode_objects,
+    zlib_compress,
+    zlib_decompress,
 } from './wasm-lib/wasm_lib.js';
 
 let config = null;
@@ -174,13 +175,10 @@ async function nearFunctionCall(method, args) {
     }
     const result = broadcastRes.result;
     if (result.status && result.status.SuccessValue !== undefined) {
-        const rawBytes = Uint8Array.from(atob(result.status.SuccessValue), c => c.charCodeAt(0));
-        // Borsh-decode for push_objects, JSON for others
-        let decoded;
-        if (method === 'push_objects') {
-            decoded = JSON.parse(borsh_decode_push_result(rawBytes));
-        } else {
-            const text = new TextDecoder().decode(rawBytes);
+        const rawBase64 = result.status.SuccessValue;
+        let decoded = null;
+        if (rawBase64 && method !== 'push_objects') {
+            const text = new TextDecoder().decode(Uint8Array.from(atob(rawBase64), c => c.charCodeAt(0)));
             decoded = text ? JSON.parse(text) : null;
         }
         return {
@@ -325,18 +323,19 @@ async function handleReceivePack(body) {
             }
         }
 
-        // Push objects to contract (signed locally)
-        const gitObjects = allObjects.map(obj => ({
-            obj_type: obj.obj_type,
-            data: uint8ArrayToBase64(obj.data),
-        }));
+        // Push objects to contract (signed locally, zlib-compressed)
+        const gitObjects = allObjects.map(obj => {
+            const sha = git_sha1(obj.obj_type, obj.data);
+            const compressed = zlib_compress(obj.data);
+            return { sha, obj_type: obj.obj_type, data: uint8ArrayToBase64(compressed) };
+        });
+        const objectShas = gitObjects.map(o => o.sha);
 
         const pushResult = await nearFunctionCall('push_objects', { objects: gitObjects });
         if (!pushResult.success) {
             return makeReceivePackResponse([`ng unpack ${pushResult.error}`]);
         }
 
-        const objectShas = pushResult.result.shas;
         const txHash = pushResult.txHash;
 
         const registerResult = await nearFunctionCall('register_push', {
@@ -375,51 +374,25 @@ async function handleUploadPack(body) {
         );
     }
 
-    // Walk object graph
+    // 1. Get all SHAs from contract
+    const allShas = await nearViewCall('get_all_shas', {});
     const havesSet = new Set(haves);
-    const needed = [];
-    const visited = new Set();
-    const queue = [...wants];
 
-    while (queue.length > 0) {
-        const sha = queue.shift();
-        if (visited.has(sha) || havesSet.has(sha)) continue;
-        visited.add(sha);
-        needed.push(sha);
+    // 2. Filter to only missing SHAs
+    const needed = allShas.filter(sha => !havesSet.has(sha));
+    console.log(`[near-git-sw] need ${needed.length} of ${allShas.length} objects`);
 
-        const objects = await nearViewCall('get_objects', { shas: [sha] });
-        for (const [, maybeObj] of objects) {
-            if (!maybeObj) continue;
-            const data = Uint8Array.from(atob(maybeObj.data), c => c.charCodeAt(0));
-
-            if (maybeObj.obj_type === 'commit') {
-                for (const line of decoder.decode(data).split('\n')) {
-                    if (line.startsWith('tree ')) queue.push(line.slice(5).trim());
-                    else if (line.startsWith('parent ')) queue.push(line.slice(7).trim());
-                    else if (line === '') break;
-                }
-            } else if (maybeObj.obj_type === 'tree') {
-                let pos = 0;
-                while (pos < data.length) {
-                    const nullPos = data.indexOf(0, pos);
-                    if (nullPos === -1 || nullPos + 21 > data.length) break;
-                    const childSha = Array.from(data.slice(nullPos + 1, nullPos + 21))
-                        .map(b => b.toString(16).padStart(2, '0')).join('');
-                    queue.push(childSha);
-                    pos = nullPos + 21;
-                }
-            }
-        }
-    }
-
-    // Fetch and build packfile using WASM
+    // 3. Fetch missing objects in batches
     const packObjects = [];
     for (let i = 0; i < needed.length; i += 50) {
         const chunk = needed.slice(i, i + 50);
         const objects = await nearViewCall('get_objects', { shas: chunk });
         for (const [, maybeObj] of objects) {
             if (maybeObj) {
-                packObjects.push({ obj_type: maybeObj.obj_type, data: maybeObj.data });
+                // Data is zlib-compressed — decompress for packfile building
+                const compressed = Uint8Array.from(atob(maybeObj.data), c => c.charCodeAt(0));
+                const decompressed = zlib_decompress(compressed);
+                packObjects.push({ obj_type: maybeObj.obj_type, data: uint8ArrayToBase64(decompressed) });
             }
         }
     }

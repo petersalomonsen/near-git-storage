@@ -291,6 +291,128 @@ fn read_delta_size(data: &[u8], start: usize) -> Result<(u64, usize), String> {
     Ok((size, pos - start))
 }
 
+/// Zlib-compress data for on-chain storage.
+pub fn zlib_compress(data: &[u8]) -> Vec<u8> {
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(data).unwrap();
+    encoder.finish().unwrap()
+}
+
+/// Zlib-decompress data retrieved from on-chain storage.
+pub fn zlib_decompress(data: &[u8]) -> Vec<u8> {
+    let mut decoder = ZlibDecoder::new(data);
+    let mut decompressed = Vec::new();
+    std::io::Read::read_to_end(&mut decoder, &mut decompressed).unwrap();
+    decompressed
+}
+
+/// Compute a binary delta from `base` to `target` using git's delta format.
+///
+/// The delta can be applied with `apply_delta(base, delta)` to reconstruct `target`.
+/// Returns delta bytes that are typically much smaller than `target` when the two
+/// inputs are similar.
+pub fn compute_delta(base: &[u8], target: &[u8]) -> Vec<u8> {
+    use std::collections::HashMap;
+
+    const BLOCK_SIZE: usize = 16;
+
+    fn fnv_hash(data: &[u8]) -> u64 {
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for &b in data {
+            hash ^= b as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash
+    }
+
+    fn encode_size(buf: &mut Vec<u8>, mut val: usize) {
+        loop {
+            let mut byte = (val & 0x7f) as u8;
+            val >>= 7;
+            if val > 0 { byte |= 0x80; }
+            buf.push(byte);
+            if val == 0 { break; }
+        }
+    }
+
+    fn emit_copy(buf: &mut Vec<u8>, offset: usize, size: usize) {
+        let mut cmd: u8 = 0x80;
+        let mut data = Vec::new();
+        for i in 0..4 {
+            let byte = ((offset >> (i * 8)) & 0xff) as u8;
+            if byte != 0 { cmd |= 1 << i; data.push(byte); }
+        }
+        let enc_size = if size == 0x10000 { 0 } else { size };
+        for i in 0..3 {
+            let byte = ((enc_size >> (i * 8)) & 0xff) as u8;
+            if byte != 0 { cmd |= 1 << (4 + i); data.push(byte); }
+        }
+        buf.push(cmd);
+        buf.extend_from_slice(&data);
+    }
+
+    fn flush_inserts(buf: &mut Vec<u8>, insert_buf: &mut Vec<u8>) {
+        while !insert_buf.is_empty() {
+            let count = insert_buf.len().min(127);
+            buf.push(count as u8);
+            buf.extend_from_slice(&insert_buf[..count]);
+            insert_buf.drain(..count);
+        }
+    }
+
+    // Build index of BLOCK_SIZE-byte windows in base
+    let mut index: HashMap<u64, Vec<usize>> = HashMap::new();
+    if base.len() >= BLOCK_SIZE {
+        for i in (0..=base.len() - BLOCK_SIZE).step_by(BLOCK_SIZE) {
+            index.entry(fnv_hash(&base[i..i + BLOCK_SIZE])).or_default().push(i);
+        }
+    }
+
+    let mut result = Vec::new();
+    encode_size(&mut result, base.len());
+    encode_size(&mut result, target.len());
+
+    let mut pos = 0;
+    let mut insert_buf: Vec<u8> = Vec::new();
+
+    while pos < target.len() {
+        let remaining = target.len() - pos;
+        let mut best_offset = 0usize;
+        let mut best_len = 0usize;
+
+        if remaining >= BLOCK_SIZE {
+            let hash = fnv_hash(&target[pos..pos + BLOCK_SIZE]);
+            if let Some(offsets) = index.get(&hash) {
+                for &base_off in offsets {
+                    let max_len = remaining.min(base.len() - base_off);
+                    let mut len = 0;
+                    while len < max_len && target[pos + len] == base[base_off + len] {
+                        len += 1;
+                    }
+                    if len > best_len { best_len = len; best_offset = base_off; }
+                }
+            }
+        }
+
+        if best_len >= BLOCK_SIZE {
+            flush_inserts(&mut result, &mut insert_buf);
+            let mut copied = 0;
+            while copied < best_len {
+                let chunk = (best_len - copied).min(0x10000);
+                emit_copy(&mut result, best_offset + copied, chunk);
+                copied += chunk;
+            }
+            pos += best_len;
+        } else {
+            insert_buf.push(target[pos]);
+            pos += 1;
+        }
+    }
+
+    flush_inserts(&mut result, &mut insert_buf);
+    result
+}
+
 /// Build a packfile from a list of objects.
 pub fn build(objects: &[PackObject]) -> Vec<u8> {
     let mut out = Vec::new();

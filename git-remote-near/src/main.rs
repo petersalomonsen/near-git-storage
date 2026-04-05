@@ -9,7 +9,7 @@
 /// or from the NEAR_SIGNER_ACCOUNT / NEAR_SIGNER_KEY env vars.
 ///
 /// Configuration via git config or env:
-///   NEAR_RPC_URL     — RPC endpoint (default: https://archival-rpc.testnet.fastnear.com)
+///   NEAR_RPC_URL     — RPC endpoint (default: https://rpc.testnet.fastnear.com)
 ///   NEAR_SIGNER_ACCOUNT — signer account ID (default: same as contract ID)
 ///   NEAR_SIGNER_KEY  — ed25519:<base58> private key (overrides credentials file)
 ///   NEAR_ENV         — "testnet" or "mainnet" (default: testnet)
@@ -23,17 +23,11 @@ use serde_json::json;
 use git_core::packfile;
 
 /// Borsh-serialized git object for push_objects calls.
-#[derive(BorshSerialize)]
+#[derive(BorshSerialize, Clone)]
 struct GitObject {
+    sha: String,
     obj_type: String,
     data: Vec<u8>,
-    base_sha: Option<String>,
-}
-
-/// Borsh-deserialized push_objects result.
-#[derive(BorshDeserialize)]
-struct PushObjectsResult {
-    shas: Vec<String>,
 }
 
 /// Borsh-deserialized object from get_objects.
@@ -162,8 +156,8 @@ async fn run(contract_id_str: &str) {
 fn resolve_network() -> near_api::NetworkConfig {
     let env = std::env::var("NEAR_ENV").unwrap_or_else(|_| "testnet".to_string());
     let default_rpc = match env.as_str() {
-        "mainnet" => "https://archival-rpc.mainnet.fastnear.com",
-        _ => "https://archival-rpc.testnet.fastnear.com",
+        "mainnet" => "https://rpc.mainnet.fastnear.com",
+        _ => "https://rpc.testnet.fastnear.com",
     };
     let rpc_url = std::env::var("NEAR_RPC_URL").unwrap_or_else(|_| default_rpc.to_string());
     near_api::NetworkConfig::from_rpc_url(&env, rpc_url.parse().unwrap())
@@ -244,76 +238,38 @@ async fn do_fetch(
     contract_id: &AccountId,
     network: &near_api::NetworkConfig,
 ) {
-    // Walk the object graph from wants
-    let mut needed: Vec<String> = Vec::new();
-    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut queue: std::collections::VecDeque<String> = wants.iter().cloned().collect();
+    // 1. Get all SHAs from the contract (tiny payload)
+    let all_shas: Vec<String> = Contract(contract_id.clone())
+        .call_function("get_all_shas", json!({}))
+        .read_only()
+        .fetch_from(network)
+        .await
+        .unwrap()
+        .data;
 
-    while let Some(sha) = queue.pop_front() {
-        if visited.contains(&sha) {
-            continue;
-        }
-        visited.insert(sha.clone());
-        needed.push(sha.clone());
+    eprintln!("git-remote-near: remote has {} objects", all_shas.len());
 
-        let shas_query = vec![sha.clone()];
-        let objects: Vec<(String, Option<RetrievedObject>)> = Contract(contract_id.clone())
-            .call_function_borsh("get_objects", &shas_query)
-            .read_only_borsh()
-            .fetch_from(network)
-            .await
-            .unwrap()
-            .data;
+    // 2. Filter out SHAs we already have locally
+    let missing: Vec<String> = all_shas
+        .into_iter()
+        .filter(|sha| {
+            !std::process::Command::new("git")
+                .args(["cat-file", "-t", sha])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        })
+        .collect();
 
-        for (_sha, maybe_obj) in objects {
-            if let Some(obj) = maybe_obj {
-                match obj.obj_type.as_str() {
-                    "commit" => {
-                        let text = String::from_utf8_lossy(&obj.data);
-                        for line in text.lines() {
-                            if let Some(tree_sha) = line.strip_prefix("tree ") {
-                                queue.push_back(tree_sha.trim().to_string());
-                            } else if let Some(parent_sha) = line.strip_prefix("parent ") {
-                                queue.push_back(parent_sha.trim().to_string());
-                            } else if line.is_empty() {
-                                break;
-                            }
-                        }
-                    }
-                    "tree" => {
-                        let mut pos = 0;
-                        while pos < obj.data.len() {
-                            let null_pos = obj.data[pos..]
-                                .iter()
-                                .position(|&b| b == 0)
-                                .map(|p| pos + p);
-                            if let Some(null_pos) = null_pos {
-                                if null_pos + 21 <= obj.data.len() {
-                                    let child_sha: String = obj.data[null_pos + 1..null_pos + 21]
-                                        .iter()
-                                        .map(|b| format!("{:02x}", b))
-                                        .collect();
-                                    queue.push_back(child_sha);
-                                    pos = null_pos + 21;
-                                } else {
-                                    break;
-                                }
-                            } else {
-                                break;
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
+    eprintln!("git-remote-near: need {} objects", missing.len());
+
+    if missing.is_empty() {
+        return;
     }
 
-    eprintln!("git-remote-near: fetching {} objects", needed.len());
-
-    // Fetch all objects in batches
+    // 3. Fetch missing objects in batches
     let mut pack_objects = Vec::new();
-    for chunk in needed.chunks(50) {
+    for chunk in missing.chunks(50) {
         let shas_query: Vec<String> = chunk.to_vec();
         let objects: Vec<(String, Option<RetrievedObject>)> = Contract(contract_id.clone())
             .call_function_borsh("get_objects", &shas_query)
@@ -327,7 +283,7 @@ async fn do_fetch(
             if let Some(obj) = maybe_obj {
                 pack_objects.push(packfile::PackObject {
                     obj_type: obj.obj_type,
-                    data: obj.data,
+                    data: packfile::zlib_decompress(&obj.data),
                 });
             }
         }
@@ -535,44 +491,80 @@ async fn do_push(
             op.dst_ref
         );
 
-        // Push objects to contract (borsh-serialized)
+        // Convert to GitObjects — client provides SHA, compresses data
+        let raw_size: usize = to_push.iter().map(|o| o.data.len()).sum();
         let git_objects: Vec<GitObject> = to_push
             .iter()
             .map(|obj| GitObject {
+                sha: obj.sha1(),
                 obj_type: obj.obj_type.clone(),
-                data: obj.data.clone(),
-                base_sha: None,
+                data: packfile::zlib_compress(&obj.data),
             })
             .collect();
+        let compressed_size: usize = git_objects.iter().map(|o| o.data.len()).sum();
+        eprintln!(
+            "git-remote-near: compressed {} -> {} bytes ({:.0}% reduction)",
+            raw_size,
+            compressed_size,
+            (1.0 - compressed_size as f64 / raw_size as f64) * 100.0
+        );
 
-        let push_result = Contract(contract_id.clone())
-            .call_function_borsh("push_objects", &git_objects)
-            .transaction()
-            .with_signer(signer_id.clone(), signer.clone())
-            .send_to(network)
-            .await;
+        let all_shas: Vec<String> = git_objects.iter().map(|o| o.sha.clone()).collect();
+        let mut last_tx_hash = String::new();
+        let mut push_failed = false;
 
-        let (tx_hash, object_shas) = match push_result {
-            Ok(r) => {
-                let tx_hash = r.transaction().get_hash().to_string();
-                if !r.is_success() {
-                    results.push(format!("error {} push_objects failed", op.dst_ref));
-                    continue;
+        // Batch size: borsh payload + base64 overhead + tx wrapper must fit RPC limit (~1.5MB)
+        const MAX_BATCH_BYTES: usize = 1_000_000;
+        let mut batch: Vec<&GitObject> = Vec::new();
+        let mut batch_size: usize = 0;
+
+        for obj in &git_objects {
+            let obj_size = obj.sha.len() + obj.obj_type.len() + obj.data.len() + 50;
+            if !batch.is_empty() && batch_size + obj_size > MAX_BATCH_BYTES {
+                let batch_vec: Vec<GitObject> = batch.iter().map(|o| (*o).clone()).collect();
+                eprintln!(
+                    "git-remote-near: pushing batch of {} objects ({} bytes)",
+                    batch_vec.len(),
+                    batch_size
+                );
+                match push_batch(&batch_vec, contract_id, signer_id, signer, network).await {
+                    Ok(tx) => last_tx_hash = tx,
+                    Err(e) => {
+                        results.push(format!("error {} {}", op.dst_ref, e));
+                        push_failed = true;
+                        break;
+                    }
                 }
-                let full = r.into_full().unwrap();
-                let data: PushObjectsResult = full.borsh().unwrap();
-                (tx_hash, data.shas)
+                batch.clear();
+                batch_size = 0;
             }
-            Err(e) => {
-                results.push(format!("error {} {}", op.dst_ref, e));
-                continue;
+            batch.push(obj);
+            batch_size += obj_size;
+        }
+
+        if !push_failed && !batch.is_empty() {
+            let batch_vec: Vec<GitObject> = batch.iter().map(|o| (*o).clone()).collect();
+            eprintln!(
+                "git-remote-near: pushing batch of {} objects ({} bytes)",
+                batch_vec.len(),
+                batch_size
+            );
+            match push_batch(&batch_vec, contract_id, signer_id, signer, network).await {
+                Ok(tx) => last_tx_hash = tx,
+                Err(e) => {
+                    results.push(format!("error {} {}", op.dst_ref, e));
+                    push_failed = true;
+                }
             }
-        };
+        }
+
+        if push_failed {
+            continue;
+        }
 
         eprintln!(
-            "git-remote-near: pushed {} objects (tx={})",
-            object_shas.len(),
-            tx_hash
+            "git-remote-near: pushed {} objects total",
+            all_shas.len()
         );
 
         // Register push and update refs
@@ -584,8 +576,8 @@ async fn do_push(
 
         match Contract(contract_id.clone())
             .call_function("register_push", json!({
-                "tx_hash": tx_hash,
-                "object_shas": object_shas,
+                "tx_hash": last_tx_hash,
+                "object_shas": all_shas,
                 "ref_updates": ref_updates,
             }))
             .transaction()
@@ -606,6 +598,30 @@ async fn do_push(
     }
 
     results
+}
+
+/// Push a batch of objects to the contract, returning the tx_hash.
+async fn push_batch(
+    objects: &[GitObject],
+    contract_id: &AccountId,
+    signer_id: &AccountId,
+    signer: &Arc<Signer>,
+    network: &near_api::NetworkConfig,
+) -> Result<String, String> {
+    let result = Contract(contract_id.clone())
+        .call_function_borsh("push_objects", objects)
+        .transaction()
+        .gas(near_api::NearGas::from_tgas(300))
+        .with_signer(signer_id.clone(), signer.clone())
+        .send_to(network)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let tx_hash = result.transaction().get_hash().to_string();
+    if !result.is_success() {
+        return Err("push_objects failed".to_string());
+    }
+    Ok(tx_hash)
 }
 
 /// Resolve a local git ref to a SHA using `git rev-parse`.

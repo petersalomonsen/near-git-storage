@@ -13,14 +13,9 @@ export function apply_delta(source: Uint8Array, delta: Uint8Array): Uint8Array;
 export function borsh_decode_objects(data: Uint8Array): string;
 
 /**
- * Decode borsh PushObjectsResult → JSON string `{"shas":["..."]}`
- */
-export function borsh_decode_push_result(data: Uint8Array): string;
-
-/**
  * Borsh-encode git objects for push_objects (JSON input with base64 data → borsh bytes).
  *
- * Input: JSON array of `[{obj_type, data(base64), base_sha?}, ...]`
+ * Input: JSON array of `[{sha, obj_type, data(base64)}, ...]`
  * Output: borsh-encoded `Vec<GitObject>` bytes
  */
 export function borsh_encode_push_objects(objects_json: string): Uint8Array;
@@ -64,19 +59,30 @@ export function git_sha1(obj_type: string, data: Uint8Array): string;
  */
 export function parse_packfile(data: Uint8Array): string;
 
+/**
+ * Zlib-compress data.
+ */
+export function zlib_compress(data: Uint8Array): Uint8Array;
+
+/**
+ * Zlib-decompress data.
+ */
+export function zlib_decompress(data: Uint8Array): Uint8Array;
+
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly apply_delta: (a: number, b: number, c: number, d: number) => [number, number, number, number];
     readonly borsh_decode_objects: (a: number, b: number) => [number, number, number, number];
-    readonly borsh_decode_push_result: (a: number, b: number) => [number, number, number, number];
     readonly borsh_encode_push_objects: (a: number, b: number) => [number, number, number, number];
     readonly borsh_encode_shas: (a: number, b: number) => [number, number, number, number];
     readonly build_packfile: (a: number, b: number) => [number, number, number, number];
     readonly create_signed_transaction: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: bigint, n: number, o: number, p: bigint, q: number, r: number) => [number, number, number, number];
     readonly git_sha1: (a: number, b: number, c: number, d: number) => [number, number];
     readonly parse_packfile: (a: number, b: number) => [number, number, number, number];
+    readonly zlib_compress: (a: number, b: number) => [number, number];
+    readonly zlib_decompress: (a: number, b: number) => [number, number];
     readonly __wbindgen_externrefs: WebAssembly.Table;
     readonly __wbindgen_malloc: (a: number, b: number) => number;
     readonly __externref_table_dealloc: (a: number) => void;
