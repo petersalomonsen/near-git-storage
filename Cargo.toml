@@ -1,5 +1,5 @@
 [workspace]
-members = ["git-core", "git-remote-near", "git-server", "wasm-lib"]
+members = ["git-core", "git-remote-near", "git-server", "wasm-lib", "factory"]
 
 [package]
 name = "near-git-storage"
@@ -10,7 +10,7 @@ edition = "2021"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-near-sdk = "5.6"
+near-sdk = "5.17"
 sha1 = "0.10"
 base64 = "0.22"
 
@@ -23,7 +23,7 @@ serde_json = "1"
 serde = "1"
 sha1 = "0.10"
 base64 = "0.22"
-near-sdk = { version = "5.6", features = ["unit-testing"] }
+near-sdk = { version = "5.17", features = ["unit-testing"] }
 
 [profile.release]
 codegen-units = 1

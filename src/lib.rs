@@ -59,13 +59,27 @@ pub struct GitStorage {
 #[near]
 impl GitStorage {
     #[init]
-    pub fn new(owner: AccountId) -> Self {
+    pub fn new() -> Self {
+        // Verify that the predecessor is the parent account (the factory).
+        // Since repos are sub-accounts (e.g. myrepo.factory.near),
+        // the factory is the parent account.
+        let current = env::current_account_id().to_string();
+        let parent = current
+            .find('.')
+            .map(|i| &current[i + 1..])
+            .unwrap_or_else(|| env::panic_str("Contract must be deployed as a sub-account of the factory"));
+        assert_eq!(
+            env::predecessor_account_id().as_str(),
+            parent,
+            "This contract can only be initialized by the factory (parent account)"
+        );
+
         Self {
             refs: IterableMap::new(b"r"),
             object_txs: IterableMap::new(b"o"),
             object_types: LookupMap::new(b"t"),
             object_data: LookupMap::new(b"d"),
-            owner,
+            owner: env::signer_account_id(),
         }
     }
 

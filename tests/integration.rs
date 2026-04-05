@@ -1,11 +1,12 @@
 use std::sync::{Arc, atomic::{AtomicU32, Ordering}};
 
-use near_api::{AccountId, Contract, Signer};
+use near_api::{AccountId, Contract, NearToken, Signer};
 use near_sandbox::Sandbox;
 use serde_json::json;
 use tokio::sync::OnceCell;
 
 const WASM_FILEPATH: &str = "res/near_git_storage.wasm";
+const FACTORY_WASM: &str = "res/near_git_factory.wasm";
 
 /// Counter for generating unique account names per test.
 static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -19,7 +20,10 @@ struct SharedSandbox {
     network: near_api::NetworkConfig,
     genesis_id: AccountId,
     genesis_signer: Arc<Signer>,
+    #[allow(dead_code)]
     wasm: Vec<u8>,
+    factory_wasm: Vec<u8>,
+    global_id: AccountId,
 }
 
 async fn get_shared_sandbox() -> &'static SharedSandbox {
@@ -38,6 +42,31 @@ async fn get_shared_sandbox() -> &'static SharedSandbox {
 
             let wasm = std::fs::read(WASM_FILEPATH)
                 .expect("Contract WASM not found. Run `./build.sh` first to build the contract.");
+            let factory_wasm = std::fs::read(FACTORY_WASM)
+                .expect("Factory WASM not found. Run `./build.sh` first.");
+
+            // Deploy git-storage WASM as a global contract tied to a "global" account
+            let global_secret = near_api::signer::generate_secret_key().unwrap();
+            let global_id: AccountId = "global.sandbox".parse().unwrap();
+
+            near_api::Account::create_account(global_id.clone())
+                .fund_myself(genesis_id.clone(), NearToken::from_near(50))
+                .with_public_key(global_secret.public_key())
+                .with_signer(genesis_signer.clone())
+                .send_to(&network)
+                .await
+                .unwrap()
+                .assert_success();
+
+            let global_signer = Signer::from_secret_key(global_secret).unwrap();
+
+            Contract::deploy_global_contract_code(wasm.clone())
+                .as_account_id(global_id.clone())
+                .with_signer(global_signer)
+                .send_to(&network)
+                .await
+                .unwrap()
+                .assert_success();
 
             SharedSandbox {
                 sandbox,
@@ -45,6 +74,8 @@ async fn get_shared_sandbox() -> &'static SharedSandbox {
                 genesis_id,
                 genesis_signer,
                 wasm,
+                factory_wasm,
+                global_id,
             }
         })
         .await
@@ -75,19 +106,17 @@ struct TestContext {
 }
 
 /// Set up a fresh contract + owner within the shared sandbox.
+/// Deploys the factory, then creates a repo via the factory.
 async fn setup() -> TestContext {
     let shared = get_shared_sandbox().await;
     let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
 
-    // Create unique owner account
+    // Create owner account
     let owner_secret = near_api::signer::generate_secret_key().unwrap();
     let owner_id: AccountId = format!("owner{n}.sandbox").parse().unwrap();
 
     near_api::Account::create_account(owner_id.clone())
-        .fund_myself(
-            shared.genesis_id.clone(),
-            near_api::NearToken::from_near(50),
-        )
+        .fund_myself(shared.genesis_id.clone(), NearToken::from_near(50))
         .with_public_key(owner_secret.public_key())
         .with_signer(shared.genesis_signer.clone())
         .send_to(&shared.network)
@@ -97,34 +126,42 @@ async fn setup() -> TestContext {
 
     let owner_signer = Signer::from_secret_key(owner_secret).unwrap();
 
-    // Create unique contract account
-    let contract_secret = near_api::signer::generate_secret_key().unwrap();
-    let contract_id: AccountId = format!("contract{n}.sandbox").parse().unwrap();
+    // Deploy factory
+    let factory_secret = near_api::signer::generate_secret_key().unwrap();
+    let factory_id: AccountId = format!("factory{n}.sandbox").parse().unwrap();
 
-    near_api::Account::create_account(contract_id.clone())
-        .fund_myself(
-            shared.genesis_id.clone(),
-            near_api::NearToken::from_near(50),
-        )
-        .with_public_key(contract_secret.public_key())
+    near_api::Account::create_account(factory_id.clone())
+        .fund_myself(shared.genesis_id.clone(), NearToken::from_near(10))
+        .with_public_key(factory_secret.public_key())
         .with_signer(shared.genesis_signer.clone())
         .send_to(&shared.network)
         .await
         .unwrap()
         .assert_success();
 
-    let contract_signer = Signer::from_secret_key(contract_secret).unwrap();
-
-    // Deploy and initialize contract
-    Contract::deploy(contract_id.clone())
-        .use_code(shared.wasm.clone())
-        .with_init_call("new", json!({ "owner": owner_id.to_string() }))
+    Contract::deploy(factory_id.clone())
+        .use_code(shared.factory_wasm.clone())
+        .with_init_call("new", json!({ "global_contract": shared.global_id.to_string() }))
         .unwrap()
-        .with_signer(contract_signer)
+        .with_signer(Signer::from_secret_key(factory_secret).unwrap())
         .send_to(&shared.network)
         .await
         .unwrap()
         .assert_success();
+
+    // Create repo via factory
+    let repo_name = format!("repo{n}");
+    Contract(factory_id.clone())
+        .call_function("create_repo", json!({ "repo_name": repo_name }))
+        .transaction()
+        .deposit(NearToken::from_near(2))
+        .with_signer(owner_id.clone(), owner_signer.clone())
+        .send_to(&shared.network)
+        .await
+        .unwrap()
+        .assert_success();
+
+    let contract_id: AccountId = format!("{}.{}", repo_name, factory_id).parse().unwrap();
 
     TestContext {
         network: shared.network.clone(),
