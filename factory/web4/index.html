@@ -33,8 +33,6 @@
     <div id="create-section">
         <label for="repo-name">Repository name</label>
         <input type="text" id="repo-name" placeholder="my-project">
-        <label for="factory-id" style="margin-top: 0.5rem;">Factory contract</label>
-        <input type="text" id="factory-id" value="gitfactory.testnet" placeholder="factory.near" style="width:100%;box-sizing:border-box;padding:0.4rem;font-family:monospace;margin-bottom:0.5rem;">
         <button id="create-btn">Create Repository</button>
     </div>
 
@@ -51,12 +49,19 @@
         const createSection = document.getElementById('create-section');
         const createBtn = document.getElementById('create-btn');
         const repoNameEl = document.getElementById('repo-name');
-        const factoryIdEl = document.getElementById('factory-id');
         const resultEl = document.getElementById('result');
         const resultDetails = document.getElementById('result-details');
 
-        const params = new URLSearchParams(location.search);
-        if (params.get('factory')) factoryIdEl.value = params.get('factory');
+        // Derive factory contract ID from hostname:
+        // gitfactory.testnet.page -> gitfactory.testnet
+        // gitfactory.near.page -> gitfactory.near
+        const host = location.hostname;
+        const factoryId = host.replace(/\.page$/, '');
+        document.querySelector('h1 + p').textContent =
+            `Create a new git repository on ${factoryId}`;
+
+        // Derive network from the factory ID
+        const network = factoryId.endsWith('.testnet') ? 'testnet' : 'mainnet';
 
         let connector, wallet, accountId;
         let signAndSendTransaction;
@@ -82,9 +87,8 @@
             setStatus('Connect your wallet to create a repository.');
         }
 
-        async function initNearConnect() {
+        async function init() {
             const { NearConnector } = await import('https://cdn.jsdelivr.net/npm/@hot-labs/near-connect@0.11.1/+esm');
-            const network = params.get('network') || 'testnet';
             connector = new NearConnector({ network });
 
             connector.on('wallet:signIn', async (event) => {
@@ -112,51 +116,9 @@
             setStatus('Connect your wallet to create a repository.');
         }
 
-        async function initSandboxDirect() {
-            // Direct sandbox mode: use near-api-js with genesis key for signing
-            const rpcUrl = params.get('rpc') || '/near-rpc';
-            const acct = params.get('account');
-            if (!acct) { setStatus('Error: ?account= required for sandbox mode'); return; }
-
-            // Load near-api-js UMD bundle for browser compatibility
-            await new Promise((resolve, reject) => {
-                const s = document.createElement('script');
-                s.src = 'https://cdn.jsdelivr.net/npm/near-api-js@4.0.4/dist/near-api-js.min.js';
-                s.onload = resolve;
-                s.onerror = reject;
-                document.head.appendChild(s);
-            });
-
-            const nearAPI = window.nearApi;
-            const GENESIS_KEY = 'ed25519:3tgdk2wPraJzT4nsTuf86UX41xgPNk3MHnq8epARMdBNs29AFEztAuaQ7iHddDfXG9F2RzV1XNQYgJyAyoW51UBB';
-            const keyStore = new nearAPI.keyStores.InMemoryKeyStore();
-            await keyStore.setKey('sandbox', acct, nearAPI.KeyPair.fromString(GENESIS_KEY));
-            const near = await nearAPI.connect({
-                networkId: 'sandbox',
-                nodeUrl: new URL(rpcUrl, location.origin).href,
-                keyStore,
-            });
-            const account = await near.account(acct);
-
-            signAndSendTransaction = async (p) => {
-                return account.functionCall({
-                    contractId: p.receiverId,
-                    methodName: p.actions[0].params.methodName,
-                    args: p.actions[0].params.args,
-                    gas: BigInt(p.actions[0].params.gas),
-                    attachedDeposit: BigInt(p.actions[0].params.deposit),
-                });
-            };
-
-            connectBtn.style.display = 'none';
-            onConnected(acct);
-        }
-
         createBtn.addEventListener('click', async () => {
             const repoName = repoNameEl.value.trim();
-            const factoryId = factoryIdEl.value.trim();
             if (!repoName) { setStatus('Please enter a repository name.'); return; }
-            if (!factoryId) { setStatus('Please enter the factory contract ID.'); return; }
 
             createBtn.disabled = true;
             setStatus('Creating repository...');
@@ -186,12 +148,7 @@
             }
         });
 
-        // Use direct sandbox signing when ?sandbox=true, otherwise near-connect
-        if (params.get('sandbox') === 'true') {
-            initSandboxDirect().catch(err => setStatus('Init error: ' + err.message));
-        } else {
-            initNearConnect().catch(err => setStatus('Init error: ' + err.message));
-        }
+        init().catch(err => setStatus('Init error: ' + err.message));
     </script>
 </body>
 </html>

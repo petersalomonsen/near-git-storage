@@ -1,4 +1,26 @@
 use near_sdk::{env, near, AccountId, NearToken, PanicOnDefault, Promise};
+use near_sdk::serde::{Deserialize, Serialize};
+use near_sdk::NearSchema;
+
+#[derive(Debug, Serialize, Deserialize, NearSchema)]
+#[serde(crate = "near_sdk::serde")]
+pub struct Web4Request {
+    pub path: String,
+    #[serde(default)]
+    pub params: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub query: std::collections::HashMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, NearSchema)]
+#[serde(crate = "near_sdk::serde", untagged)]
+pub enum Web4Response {
+    Body {
+        #[serde(rename = "contentType")]
+        content_type: String,
+        body: String,
+    },
+}
 
 #[near(contract_state)]
 #[derive(PanicOnDefault)]
@@ -27,8 +49,8 @@ impl GitFactory {
         let deposit = env::attached_deposit();
 
         assert!(
-            deposit >= NearToken::from_millinear(500),
-            "Attach at least 0.5 NEAR for storage"
+            deposit >= NearToken::from_millinear(100),
+            "Attach at least 0.1 NEAR for account creation and initial storage"
         );
 
         Promise::new(sub_account)
@@ -46,5 +68,13 @@ impl GitFactory {
     /// Return the global contract account ID.
     pub fn get_global_contract(&self) -> AccountId {
         self.global_contract.clone()
+    }
+
+    /// Web4 handler — serves the create-repo UI.
+    pub fn web4_get(&self, #[allow(unused)] request: Web4Request) -> Web4Response {
+        Web4Response::Body {
+            content_type: "text/html".to_string(),
+            body: include_str!("../web4/index.html.base64").to_string(),
+        }
     }
 }
