@@ -49,8 +49,8 @@ impl GitFactory {
         let deposit = env::attached_deposit();
 
         assert!(
-            deposit >= NearToken::from_millinear(100),
-            "Attach at least 0.1 NEAR for account creation and initial storage"
+            deposit >= NearToken::from_near(1),
+            "Attach at least 1 NEAR for account creation and storage"
         );
 
         Promise::new(sub_account)
