@@ -218,112 +218,200 @@ async fn list_refs(
     result.into_iter().map(|(name, sha)| (sha, name)).collect()
 }
 
+/// Fetch objects from archival RPC by transaction hash.
+/// Extracts push_objects args from the transaction to recover git objects.
+async fn fetch_objects_from_tx(
+    tx_hash: &str,
+    signer_id: &str,
+    rpc_url: &str,
+) -> Vec<packfile::PackObject> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(rpc_url)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "EXPERIMENTAL_tx_status",
+            "params": {
+                "tx_hash": tx_hash,
+                "sender_account_id": signer_id,
+                "wait_until": "EXECUTED",
+            },
+        }))
+        .send()
+        .await
+        .expect("archival RPC request failed");
+
+    let data: serde_json::Value = resp.json().await.expect("invalid RPC response");
+    let tx = &data["result"]["transaction"];
+    let actions = tx["actions"].as_array();
+
+    let mut objects = Vec::new();
+    if let Some(actions) = actions {
+        for action in actions {
+            if let Some(fc) = action.get("FunctionCall") {
+                if fc["method_name"].as_str() == Some("push_objects") {
+                    let args_b64 = fc["args"].as_str().unwrap_or("");
+                    let args_bytes = base64::engine::general_purpose::STANDARD
+                        .decode(args_b64)
+                        .unwrap_or_default();
+                    let args: serde_json::Value =
+                        serde_json::from_slice(&args_bytes).unwrap_or(json!(null));
+
+                    if let Some(objs) = args["objects"].as_array() {
+                        for obj in objs {
+                            let obj_type =
+                                obj["obj_type"].as_str().unwrap_or("blob").to_string();
+                            let data_b64 = obj["data"].as_str().unwrap_or("");
+                            let obj_data = base64::engine::general_purpose::STANDARD
+                                .decode(data_b64)
+                                .unwrap_or_default();
+                            objects.push(packfile::PackObject {
+                                obj_type,
+                                data: obj_data,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    objects
+}
+
+/// Extract child SHAs from a git object for graph walking.
+fn extract_children(obj: &packfile::PackObject) -> Vec<String> {
+    let mut children = Vec::new();
+    match obj.obj_type.as_str() {
+        "commit" => {
+            let text = String::from_utf8_lossy(&obj.data);
+            for line in text.lines() {
+                if let Some(tree_sha) = line.strip_prefix("tree ") {
+                    children.push(tree_sha.trim().to_string());
+                } else if let Some(parent_sha) = line.strip_prefix("parent ") {
+                    children.push(parent_sha.trim().to_string());
+                } else if line.is_empty() {
+                    break;
+                }
+            }
+        }
+        "tree" => {
+            let mut pos = 0;
+            while pos < obj.data.len() {
+                let null_pos = obj.data[pos..]
+                    .iter()
+                    .position(|&b| b == 0)
+                    .map(|p| pos + p);
+                if let Some(null_pos) = null_pos {
+                    if null_pos + 21 <= obj.data.len() {
+                        let child_sha: String = obj.data[null_pos + 1..null_pos + 21]
+                            .iter()
+                            .map(|b| format!("{:02x}", b))
+                            .collect();
+                        children.push(child_sha);
+                        pos = null_pos + 21;
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+        _ => {}
+    }
+    children
+}
+
 async fn do_fetch(
     wants: &[String],
     contract_id: &AccountId,
     network: &near_api::NetworkConfig,
 ) {
-    // Walk the object graph from wants
-    let mut needed: Vec<String> = Vec::new();
-    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let rpc_url = network.rpc_endpoints.first()
+        .map(|e| e.url.to_string())
+        .expect("no RPC endpoint configured");
+
+    // Step 1: Walk the object graph to find all needed SHAs.
+    // We fetch one SHA at a time, get its tx, extract objects, then walk children.
+    let mut all_objects: Vec<packfile::PackObject> = Vec::new();
+    let mut sha_to_obj: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut visited_txs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut visited_shas: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut queue: std::collections::VecDeque<String> = wants.iter().cloned().collect();
 
-    while let Some(sha) = queue.pop_front() {
-        if visited.contains(&sha) {
+    while !queue.is_empty() {
+        // Collect current batch of needed SHAs
+        let mut batch: Vec<String> = Vec::new();
+        while let Some(sha) = queue.pop_front() {
+            if visited_shas.contains(&sha) {
+                continue;
+            }
+            visited_shas.insert(sha.clone());
+            batch.push(sha);
+            if batch.len() >= 50 {
+                break;
+            }
+        }
+        if batch.is_empty() {
             continue;
         }
-        visited.insert(sha.clone());
-        needed.push(sha.clone());
 
-        let objects: Vec<(String, Option<serde_json::Value>)> = Contract(contract_id.clone())
-            .call_function("get_objects", json!({ "shas": [&sha] }))
+        // Get tx locations for this batch
+        let locations: Vec<(String, Option<String>)> = Contract(contract_id.clone())
+            .call_function("get_object_locations", json!({ "shas": &batch }))
             .read_only()
             .fetch_from(network)
             .await
             .unwrap()
             .data;
 
-        for (_sha, maybe_obj) in objects {
-            if let Some(obj) = maybe_obj {
-                let obj_type = obj["obj_type"].as_str().unwrap_or("");
-                let data_b64 = obj["data"].as_str().unwrap_or("");
-                let data = base64::engine::general_purpose::STANDARD
-                    .decode(data_b64)
-                    .unwrap_or_default();
-
-                match obj_type {
-                    "commit" => {
-                        let text = String::from_utf8_lossy(&data);
-                        for line in text.lines() {
-                            if let Some(tree_sha) = line.strip_prefix("tree ") {
-                                queue.push_back(tree_sha.trim().to_string());
-                            } else if let Some(parent_sha) = line.strip_prefix("parent ") {
-                                queue.push_back(parent_sha.trim().to_string());
-                            } else if line.is_empty() {
-                                break;
-                            }
-                        }
-                    }
-                    "tree" => {
-                        let mut pos = 0;
-                        while pos < data.len() {
-                            let null_pos = data[pos..]
-                                .iter()
-                                .position(|&b| b == 0)
-                                .map(|p| pos + p);
-                            if let Some(null_pos) = null_pos {
-                                if null_pos + 21 <= data.len() {
-                                    let child_sha: String = data[null_pos + 1..null_pos + 21]
-                                        .iter()
-                                        .map(|b| format!("{:02x}", b))
-                                        .collect();
-                                    queue.push_back(child_sha);
-                                    pos = null_pos + 21;
-                                } else {
-                                    break;
-                                }
-                            } else {
-                                break;
-                            }
-                        }
-                    }
-                    _ => {}
+        // Fetch unique transactions and extract objects
+        for (sha, maybe_tx) in &locations {
+            if let Some(tx_hash) = maybe_tx {
+                if visited_txs.contains(tx_hash) {
+                    continue;
                 }
+                visited_txs.insert(tx_hash.clone());
+
+                eprintln!("git-remote-near: fetching tx {}", tx_hash);
+                let tx_objects = fetch_objects_from_tx(
+                    tx_hash,
+                    contract_id.as_ref(),
+                    &rpc_url,
+                ).await;
+
+                // Index and walk children
+                for obj in tx_objects {
+                    let obj_sha = git_sha_of(&obj);
+                    for child in extract_children(&obj) {
+                        if !visited_shas.contains(&child) {
+                            queue.push_back(child);
+                        }
+                    }
+                    if !sha_to_obj.contains_key(&obj_sha) {
+                        sha_to_obj.insert(obj_sha, all_objects.len());
+                        all_objects.push(obj);
+                    }
+                }
+            } else {
+                eprintln!("git-remote-near: warning: no tx location for {}", sha);
             }
         }
     }
 
-    eprintln!("git-remote-near: fetching {} objects", needed.len());
+    eprintln!(
+        "git-remote-near: fetched {} objects from {} transactions",
+        all_objects.len(),
+        visited_txs.len()
+    );
 
-    // Fetch all objects in batches
-    let mut pack_objects = Vec::new();
-    for chunk in needed.chunks(50) {
-        let objects: Vec<(String, Option<serde_json::Value>)> = Contract(contract_id.clone())
-            .call_function("get_objects", json!({ "shas": chunk }))
-            .read_only()
-            .fetch_from(network)
-            .await
-            .unwrap()
-            .data;
-
-        for (_sha, maybe_obj) in objects {
-            if let Some(obj) = maybe_obj {
-                let obj_type = obj["obj_type"].as_str().unwrap_or("blob").to_string();
-                let data_b64 = obj["data"].as_str().unwrap_or("");
-                let data = base64::engine::general_purpose::STANDARD
-                    .decode(data_b64)
-                    .unwrap_or_default();
-                pack_objects.push(packfile::PackObject { obj_type, data });
-            }
-        }
-    }
-
-    // Build packfile and feed to `git index-pack` to import into local repo
-    let pack_data = packfile::build(&pack_objects);
+    // Build packfile and feed to `git index-pack`
+    let pack_data = packfile::build(&all_objects);
     eprintln!(
         "git-remote-near: indexing packfile ({} bytes, {} objects)",
         pack_data.len(),
-        pack_objects.len()
+        all_objects.len()
     );
 
     let mut child = std::process::Command::new("git")
@@ -348,6 +436,16 @@ async fn do_fetch(
             String::from_utf8_lossy(&output.stderr)
         );
     }
+}
+
+/// Compute git SHA-1 for a PackObject.
+fn git_sha_of(obj: &packfile::PackObject) -> String {
+    use sha1::{Digest, Sha1};
+    let header = format!("{} {}\0", obj.obj_type, obj.data.len());
+    let mut hasher = Sha1::new();
+    hasher.update(header.as_bytes());
+    hasher.update(&obj.data);
+    hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 async fn do_push(

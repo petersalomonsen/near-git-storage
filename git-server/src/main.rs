@@ -19,6 +19,101 @@ use serde::Deserialize;
 use serde_json::json;
 use tracing::{error, info};
 
+/// Fetch git objects from a push_objects transaction via archival RPC.
+async fn fetch_objects_from_tx(
+    rpc_url: &str,
+    tx_hash: &str,
+    signer_id: &str,
+) -> Vec<packfile::PackObject> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(rpc_url)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "EXPERIMENTAL_tx_status",
+            "params": {
+                "tx_hash": tx_hash,
+                "sender_account_id": signer_id,
+                "wait_until": "EXECUTED",
+            },
+        }))
+        .send()
+        .await
+        .expect("archival RPC request failed");
+
+    let data: serde_json::Value = resp.json().await.expect("invalid RPC response");
+    let actions = data["result"]["transaction"]["actions"].as_array();
+
+    let mut objects = Vec::new();
+    if let Some(actions) = actions {
+        for action in actions {
+            if let Some(fc) = action.get("FunctionCall") {
+                if fc["method_name"].as_str() == Some("push_objects") {
+                    let args_b64 = fc["args"].as_str().unwrap_or("");
+                    let args_bytes = base64::engine::general_purpose::STANDARD
+                        .decode(args_b64)
+                        .unwrap_or_default();
+                    if let Ok(args) = serde_json::from_slice::<serde_json::Value>(&args_bytes) {
+                        if let Some(objs) = args["objects"].as_array() {
+                            for obj in objs {
+                                let obj_type = obj["obj_type"].as_str().unwrap_or("blob").to_string();
+                                let data_b64 = obj["data"].as_str().unwrap_or("");
+                                let obj_data = base64::engine::general_purpose::STANDARD
+                                    .decode(data_b64)
+                                    .unwrap_or_default();
+                                objects.push(packfile::PackObject { obj_type, data: obj_data });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    objects
+}
+
+/// Extract child SHAs from a git object for graph walking.
+fn extract_children(obj: &packfile::PackObject) -> Vec<String> {
+    let mut children = Vec::new();
+    match obj.obj_type.as_str() {
+        "commit" => {
+            let text = String::from_utf8_lossy(&obj.data);
+            for line in text.lines() {
+                if let Some(tree_sha) = line.strip_prefix("tree ") {
+                    children.push(tree_sha.trim().to_string());
+                } else if let Some(parent_sha) = line.strip_prefix("parent ") {
+                    children.push(parent_sha.trim().to_string());
+                } else if line.is_empty() {
+                    break;
+                }
+            }
+        }
+        "tree" => {
+            let mut pos = 0;
+            while pos < obj.data.len() {
+                let null_pos = obj.data[pos..].iter().position(|&b| b == 0).map(|p| pos + p);
+                if let Some(null_pos) = null_pos {
+                    if null_pos + 21 <= obj.data.len() {
+                        let child_sha: String = obj.data[null_pos + 1..null_pos + 21]
+                            .iter()
+                            .map(|b| format!("{:02x}", b))
+                            .collect();
+                        children.push(child_sha);
+                        pos = null_pos + 21;
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+        _ => {}
+    }
+    children
+}
+
 /// Shared application state.
 struct AppState {
     #[allow(dead_code)]
@@ -329,30 +424,27 @@ async fn handle_receive_pack(
                 let base = if let Some((obj_type, data)) = local_objects.get(&delta.base_sha) {
                     Some((obj_type.clone(), data.clone()))
                 } else {
-                    // Fetch from contract
-                    let result: Vec<(String, Option<serde_json::Value>)> =
+                    // Fetch base object from archival transaction
+                    let rpc_url = state.network.rpc_endpoints.first()
+                        .map(|e| e.url.to_string()).unwrap_or_default();
+                    let locations: Vec<(String, Option<String>)> =
                         Contract(state.contract_id.clone())
-                            .call_function(
-                                "get_objects",
-                                json!({ "shas": [&delta.base_sha] }),
-                            )
+                            .call_function("get_object_locations", json!({ "shas": [&delta.base_sha] }))
                             .read_only()
                             .fetch_from(&state.network)
                             .await
                             .unwrap()
                             .data;
-
-                    result.into_iter().next().and_then(|(_, v)| {
-                        v.map(|obj| {
-                            let obj_type =
-                                obj["obj_type"].as_str().unwrap_or("blob").to_string();
-                            let data_b64 = obj["data"].as_str().unwrap_or("");
-                            let data = base64::engine::general_purpose::STANDARD
-                                .decode(data_b64)
-                                .unwrap_or_default();
-                            (obj_type, data)
-                        })
-                    })
+                    let mut found = None;
+                    if let Some((_, Some(tx_hash))) = locations.into_iter().next() {
+                        let tx_objects = fetch_objects_from_tx(&rpc_url, &tx_hash, state.contract_id.as_ref()).await;
+                        for obj in &tx_objects {
+                            local_objects.insert(obj.sha1(), (obj.obj_type.clone(), obj.data.clone()));
+                        }
+                        found = local_objects.get(&delta.base_sha)
+                            .map(|(t, d)| (t.clone(), d.clone()));
+                    }
+                    found
                 };
 
                 match base {
@@ -588,111 +680,61 @@ async fn handle_upload_pack(
         return (StatusCode::OK, headers, body).into_response();
     }
 
-    // Walk the object graph from wants, stopping at haves
+    // Walk the object graph from wants, stopping at haves.
+    // Fetch objects from archival transactions via get_object_locations.
+    let rpc_url = state.network.rpc_endpoints.first()
+        .map(|e| e.url.to_string()).unwrap_or_default();
     let haves_set: std::collections::HashSet<String> = haves.into_iter().collect();
-    let mut needed: Vec<String> = Vec::new();
-    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut pack_objects: Vec<packfile::PackObject> = Vec::new();
+    let mut sha_to_idx: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut visited_txs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut visited_shas: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut queue: std::collections::VecDeque<String> = wants.into_iter().collect();
 
-    while let Some(sha) = queue.pop_front() {
-        if visited.contains(&sha) || haves_set.contains(&sha) {
-            continue;
+    while !queue.is_empty() {
+        let mut batch: Vec<String> = Vec::new();
+        while let Some(sha) = queue.pop_front() {
+            if visited_shas.contains(&sha) || haves_set.contains(&sha) {
+                continue;
+            }
+            visited_shas.insert(sha.clone());
+            batch.push(sha);
+            if batch.len() >= 50 { break; }
         }
-        visited.insert(sha.clone());
-        needed.push(sha.clone());
+        if batch.is_empty() { continue; }
 
-        // Fetch this object to find children
-        let objects: Vec<(String, Option<serde_json::Value>)> =
+        let locations: Vec<(String, Option<String>)> =
             Contract(state.contract_id.clone())
-                .call_function("get_objects", json!({ "shas": [&sha] }))
+                .call_function("get_object_locations", json!({ "shas": &batch }))
                 .read_only()
                 .fetch_from(&state.network)
                 .await
                 .unwrap()
                 .data;
 
-        for (_sha, maybe_obj) in objects {
-            if let Some(obj) = maybe_obj {
-                let obj_type = obj["obj_type"].as_str().unwrap_or("");
-                let data_b64 = obj["data"].as_str().unwrap_or("");
-                let data = base64::engine::general_purpose::STANDARD
-                    .decode(data_b64)
-                    .unwrap_or_default();
+        for (_, maybe_tx) in &locations {
+            if let Some(tx_hash) = maybe_tx {
+                if visited_txs.contains(tx_hash) { continue; }
+                visited_txs.insert(tx_hash.clone());
 
-                // Parse children depending on type
-                match obj_type {
-                    "commit" => {
-                        // Parse commit to find tree and parent SHAs
-                        let text = String::from_utf8_lossy(&data);
-                        for line in text.lines() {
-                            if let Some(tree_sha) = line.strip_prefix("tree ") {
-                                queue.push_back(tree_sha.trim().to_string());
-                            } else if let Some(parent_sha) = line.strip_prefix("parent ") {
-                                queue.push_back(parent_sha.trim().to_string());
-                            } else if line.is_empty() {
-                                break; // End of headers
-                            }
+                let tx_objects = fetch_objects_from_tx(&rpc_url, tx_hash, state.contract_id.as_ref()).await;
+                for obj in tx_objects {
+                    let obj_sha = obj.sha1();
+                    for child in extract_children(&obj) {
+                        if !visited_shas.contains(&child) && !haves_set.contains(&child) {
+                            queue.push_back(child);
                         }
                     }
-                    "tree" => {
-                        // Parse tree entries: <mode> <name>\0<20-byte-sha>
-                        let mut pos = 0;
-                        while pos < data.len() {
-                            // Find the null byte
-                            let null_pos = data[pos..]
-                                .iter()
-                                .position(|&b| b == 0)
-                                .map(|p| pos + p);
-                            if let Some(null_pos) = null_pos {
-                                if null_pos + 21 <= data.len() {
-                                    let child_sha_bytes = &data[null_pos + 1..null_pos + 21];
-                                    let child_sha: String = child_sha_bytes
-                                        .iter()
-                                        .map(|b| format!("{:02x}", b))
-                                        .collect();
-                                    queue.push_back(child_sha);
-                                    pos = null_pos + 21;
-                                } else {
-                                    break;
-                                }
-                            } else {
-                                break;
-                            }
-                        }
+                    if !sha_to_idx.contains_key(&obj_sha) {
+                        sha_to_idx.insert(obj_sha, pack_objects.len());
+                        pack_objects.push(obj);
                     }
-                    _ => {} // blob, tag — no children to walk
                 }
             }
         }
     }
 
-    info!("  need {} objects total", needed.len());
-
-    // Fetch all needed objects in batches
-    let mut pack_objects = Vec::new();
-
-    for chunk in needed.chunks(50) {
-        let objects: Vec<(String, Option<serde_json::Value>)> =
-            Contract(state.contract_id.clone())
-                .call_function("get_objects", json!({ "shas": chunk }))
-                .read_only()
-                .fetch_from(&state.network)
-                .await
-                .unwrap()
-                .data;
-
-        for (_sha, maybe_obj) in objects {
-            if let Some(obj) = maybe_obj {
-                let obj_type = obj["obj_type"].as_str().unwrap_or("blob").to_string();
-                let data_b64 = obj["data"].as_str().unwrap_or("");
-                let data = base64::engine::general_purpose::STANDARD
-                    .decode(data_b64)
-                    .unwrap_or_default();
-
-                pack_objects.push(packfile::PackObject { obj_type, data });
-            }
-        }
-    }
+    info!("  fetched {} objects from {} transactions", pack_objects.len(), visited_txs.len());
 
     // Build packfile
     let pack_data = packfile::build(&pack_objects);

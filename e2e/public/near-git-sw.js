@@ -264,13 +264,16 @@ async function handleReceivePack(body) {
                 const deltaData = Uint8Array.from(atob(delta.delta_data), c => c.charCodeAt(0));
                 let base = localMap[delta.base_sha];
                 if (!base) {
-                    const result = await nearViewCall('get_objects', { shas: [delta.base_sha] });
-                    if (result[0] && result[0][1]) {
-                        const objData = result[0][1];
-                        base = {
-                            obj_type: objData.obj_type,
-                            data: Uint8Array.from(atob(objData.data), c => c.charCodeAt(0)),
-                        };
+                    // Fetch base object from archival transaction
+                    const locations = await nearViewCall('get_object_locations', { shas: [delta.base_sha] });
+                    if (locations[0] && locations[0][1]) {
+                        const txObjects = await fetchObjectsFromTx(locations[0][1], config.accountId);
+                        for (const obj of txObjects) {
+                            const data = Uint8Array.from(atob(obj.data), c => c.charCodeAt(0));
+                            const objSha = git_sha1(obj.obj_type, data);
+                            localMap[objSha] = { obj_type: obj.obj_type, data };
+                        }
+                        base = localMap[delta.base_sha];
                     }
                 }
                 if (!base) {
@@ -315,6 +318,62 @@ async function handleReceivePack(body) {
     return makeReceivePackResponse(statusLines);
 }
 
+/// Fetch git objects from a push_objects transaction via archival RPC.
+async function fetchObjectsFromTx(txHash, signerId) {
+    const resp = await fetch(config.rpcUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            jsonrpc: '2.0', id: 1,
+            method: 'EXPERIMENTAL_tx_status',
+            params: {
+                tx_hash: txHash,
+                sender_account_id: signerId,
+                wait_until: 'EXECUTED',
+            },
+        }),
+    });
+    const data = await resp.json();
+    const actions = data.result?.transaction?.actions || [];
+    const objects = [];
+
+    for (const action of actions) {
+        const fc = action.FunctionCall;
+        if (fc && fc.method_name === 'push_objects') {
+            const argsBytes = Uint8Array.from(atob(fc.args), c => c.charCodeAt(0));
+            const args = JSON.parse(new TextDecoder().decode(argsBytes));
+            for (const obj of (args.objects || [])) {
+                objects.push(obj);
+            }
+        }
+    }
+    return objects;
+}
+
+/// Extract child SHAs from a git object for graph walking.
+function extractChildren(objType, data) {
+    const children = [];
+    const decoder = new TextDecoder();
+    if (objType === 'commit') {
+        for (const line of decoder.decode(data).split('\n')) {
+            if (line.startsWith('tree ')) children.push(line.slice(5).trim());
+            else if (line.startsWith('parent ')) children.push(line.slice(7).trim());
+            else if (line === '') break;
+        }
+    } else if (objType === 'tree') {
+        let pos = 0;
+        while (pos < data.length) {
+            const nullPos = data.indexOf(0, pos);
+            if (nullPos === -1 || nullPos + 21 > data.length) break;
+            const childSha = Array.from(data.slice(nullPos + 1, nullPos + 21))
+                .map(b => b.toString(16).padStart(2, '0')).join('');
+            children.push(childSha);
+            pos = nullPos + 21;
+        }
+    }
+    return children;
+}
+
 async function handleUploadPack(body) {
     const { lines } = readPktLines(body);
     const decoder = new TextDecoder();
@@ -334,51 +393,52 @@ async function handleUploadPack(body) {
         );
     }
 
-    // Walk object graph
+    // Walk object graph, fetching objects from archival transactions
     const havesSet = new Set(haves);
-    const needed = [];
-    const visited = new Set();
+    const visitedShas = new Set();
+    const visitedTxs = new Set();
+    const packObjects = []; // { obj_type, data (base64) }
+    const objectMap = new Map(); // sha -> { obj_type, data (Uint8Array) }
     const queue = [...wants];
 
+    // Get signer ID from contract for archival RPC queries
+    const owner = config.accountId;
+
     while (queue.length > 0) {
-        const sha = queue.shift();
-        if (visited.has(sha) || havesSet.has(sha)) continue;
-        visited.add(sha);
-        needed.push(sha);
-
-        const objects = await nearViewCall('get_objects', { shas: [sha] });
-        for (const [, maybeObj] of objects) {
-            if (!maybeObj) continue;
-            const data = Uint8Array.from(atob(maybeObj.data), c => c.charCodeAt(0));
-
-            if (maybeObj.obj_type === 'commit') {
-                for (const line of decoder.decode(data).split('\n')) {
-                    if (line.startsWith('tree ')) queue.push(line.slice(5).trim());
-                    else if (line.startsWith('parent ')) queue.push(line.slice(7).trim());
-                    else if (line === '') break;
-                }
-            } else if (maybeObj.obj_type === 'tree') {
-                let pos = 0;
-                while (pos < data.length) {
-                    const nullPos = data.indexOf(0, pos);
-                    if (nullPos === -1 || nullPos + 21 > data.length) break;
-                    const childSha = Array.from(data.slice(nullPos + 1, nullPos + 21))
-                        .map(b => b.toString(16).padStart(2, '0')).join('');
-                    queue.push(childSha);
-                    pos = nullPos + 21;
-                }
-            }
+        // Collect batch of needed SHAs
+        const batch = [];
+        while (queue.length > 0 && batch.length < 50) {
+            const sha = queue.shift();
+            if (visitedShas.has(sha) || havesSet.has(sha)) continue;
+            visitedShas.add(sha);
+            batch.push(sha);
         }
-    }
+        if (batch.length === 0) continue;
 
-    // Fetch and build packfile using WASM
-    const packObjects = [];
-    for (let i = 0; i < needed.length; i += 50) {
-        const chunk = needed.slice(i, i + 50);
-        const objects = await nearViewCall('get_objects', { shas: chunk });
-        for (const [, maybeObj] of objects) {
-            if (maybeObj) {
-                packObjects.push({ obj_type: maybeObj.obj_type, data: maybeObj.data });
+        // Get tx locations
+        const locations = await nearViewCall('get_object_locations', { shas: batch });
+
+        for (const [, txHash] of locations) {
+            if (!txHash || visitedTxs.has(txHash)) continue;
+            visitedTxs.add(txHash);
+
+            // Fetch objects from the transaction
+            const txObjects = await fetchObjectsFromTx(txHash, owner);
+            for (const obj of txObjects) {
+                const data = Uint8Array.from(atob(obj.data), c => c.charCodeAt(0));
+                const objSha = git_sha1(obj.obj_type, data);
+
+                if (!objectMap.has(objSha)) {
+                    objectMap.set(objSha, { obj_type: obj.obj_type, data });
+                    packObjects.push({ obj_type: obj.obj_type, data: obj.data });
+
+                    // Walk children
+                    for (const child of extractChildren(obj.obj_type, data)) {
+                        if (!visitedShas.has(child) && !havesSet.has(child)) {
+                            queue.push(child);
+                        }
+                    }
+                }
             }
         }
     }
