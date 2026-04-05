@@ -85,11 +85,14 @@ async function proxyToNearRpc(req, res) {
 }
 
 http.createServer((req, res) => {
-    // Required for SharedArrayBuffer (wasm-git pthreads)
-    res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
-    res.setHeader('Cross-Origin-Embedder-Policy', 'credentialless');
-
     const urlPath = (req.url || '/').split('?')[0];
+
+    // SharedArrayBuffer headers needed for wasm-git pthreads,
+    // but skip for create-repo page which uses near-connect (COOP breaks popups)
+    if (urlPath !== '/create-repo') {
+        res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+        res.setHeader('Cross-Origin-Embedder-Policy', 'credentialless');
+    }
 
     // Handle OPTIONS preflight
     if (req.method === 'OPTIONS') {
@@ -134,6 +137,8 @@ http.createServer((req, res) => {
         filePath = path.join('public', 'index-sw.html');
     } else if (urlPath === '/testnet') {
         filePath = path.join('public', 'testnet.html');
+    } else if (urlPath === '/create-repo') {
+        filePath = path.join('public', 'create-repo.html');
     } else {
         filePath = path.join('public', urlPath);
     }

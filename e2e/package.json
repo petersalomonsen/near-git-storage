@@ -14,6 +14,9 @@
     "wasm-git": "^0.0.14"
   },
   "devDependencies": {
-    "@playwright/test": "^1.52.0"
+    "@near-js/crypto": "^2.5.1",
+    "@near-js/transactions": "^2.5.1",
+    "@playwright/test": "^1.52.0",
+    "bs58": "^6.0.0"
   }
 }
