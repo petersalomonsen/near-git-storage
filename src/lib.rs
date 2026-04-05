@@ -1,5 +1,5 @@
 use near_sdk::store::{IterableMap, LookupMap};
-use near_sdk::{env, near, AccountId, PanicOnDefault};
+use near_sdk::{env, near, AccountId, PanicOnDefault, Promise};
 use sha1::{Digest, Sha1};
 
 /// A git object SHA-1 hash as a 40-character hex string.
@@ -59,13 +59,27 @@ pub struct GitStorage {
 #[near]
 impl GitStorage {
     #[init]
-    pub fn new(owner: AccountId) -> Self {
+    pub fn new() -> Self {
+        // Verify that the predecessor is the parent account (the factory).
+        // Since repos are sub-accounts (e.g. myrepo.factory.near),
+        // the factory is the parent account.
+        let current = env::current_account_id().to_string();
+        let parent = current
+            .find('.')
+            .map(|i| &current[i + 1..])
+            .unwrap_or_else(|| env::panic_str("Contract must be deployed as a sub-account of the factory"));
+        assert_eq!(
+            env::predecessor_account_id().as_str(),
+            parent,
+            "This contract can only be initialized by the factory (parent account)"
+        );
+
         Self {
             refs: IterableMap::new(b"r"),
             object_txs: IterableMap::new(b"o"),
             object_types: LookupMap::new(b"t"),
             object_data: LookupMap::new(b"d"),
-            owner,
+            owner: env::signer_account_id(),
         }
     }
 
@@ -197,6 +211,13 @@ impl GitStorage {
     /// Return the contract owner.
     pub fn get_owner(&self) -> AccountId {
         self.owner.clone()
+    }
+
+    /// Delete this repo contract and send remaining funds to the owner.
+    /// Can only be called by the owner.
+    pub fn self_delete(&mut self) -> Promise {
+        self.assert_owner();
+        Promise::new(env::current_account_id()).delete_account(self.owner.clone())
     }
 }
 

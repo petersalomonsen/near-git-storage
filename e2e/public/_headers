@@ -1,0 +1,7 @@
+/*
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Embedder-Policy: credentialless
+
+/create-repo
+  ! Cross-Origin-Opener-Policy
+  ! Cross-Origin-Embedder-Policy

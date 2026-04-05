@@ -78,35 +78,74 @@ async fn main() {
 
     let owner_signer = Signer::from_secret_key(owner_secret).unwrap();
 
-    // Create contract account and deploy
-    let contract_secret = near_api::signer::generate_secret_key().unwrap();
-    let contract_id: AccountId = "repo.sandbox".parse().unwrap();
+    // Deploy git-storage WASM as a global contract
+    let global_secret = near_api::signer::generate_secret_key().unwrap();
+    let global_id: AccountId = "gitglobal.sandbox".parse().unwrap();
 
-    near_api::Account::create_account(contract_id.clone())
-        .fund_myself(genesis_id.clone(), near_api::NearToken::from_near(100))
-        .with_public_key(contract_secret.public_key())
-        .with_signer(genesis_signer)
+    near_api::Account::create_account(global_id.clone())
+        .fund_myself(genesis_id.clone(), near_api::NearToken::from_near(50))
+        .with_public_key(global_secret.public_key())
+        .with_signer(genesis_signer.clone())
         .send_to(&network)
         .await
         .unwrap()
         .assert_success();
 
-    let contract_signer = Signer::from_secret_key(contract_secret).unwrap();
-
-    let wasm = std::fs::read("res/near_git_storage.wasm")
+    let storage_wasm = std::fs::read("res/near_git_storage.wasm")
         .expect("Contract WASM not found. Run `./build.sh` first.");
 
-    Contract::deploy(contract_id.clone())
-        .use_code(wasm)
-        .with_init_call("new", json!({ "owner": owner_id.to_string() }))
-        .unwrap()
-        .with_signer(contract_signer)
+    Contract::deploy_global_contract_code(storage_wasm)
+        .as_account_id(global_id.clone())
+        .with_signer(Signer::from_secret_key(global_secret).unwrap())
         .send_to(&network)
         .await
         .unwrap()
         .assert_success();
 
-    info!("Contract deployed at {}", contract_id);
+    info!("Global contract deployed at {}", global_id);
+
+    // Deploy factory contract
+    let factory_secret = near_api::signer::generate_secret_key().unwrap();
+    let factory_id: AccountId = "factory.sandbox".parse().unwrap();
+
+    near_api::Account::create_account(factory_id.clone())
+        .fund_myself(genesis_id.clone(), near_api::NearToken::from_near(50))
+        .with_public_key(factory_secret.public_key())
+        .with_signer(genesis_signer.clone())
+        .send_to(&network)
+        .await
+        .unwrap()
+        .assert_success();
+
+    let factory_wasm = std::fs::read("res/near_git_factory.wasm")
+        .expect("Factory WASM not found. Run `./build.sh` first.");
+
+    Contract::deploy(factory_id.clone())
+        .use_code(factory_wasm)
+        .with_init_call("new", json!({ "global_contract": global_id.to_string() }))
+        .unwrap()
+        .with_signer(Signer::from_secret_key(factory_secret).unwrap())
+        .send_to(&network)
+        .await
+        .unwrap()
+        .assert_success();
+
+    info!("Factory deployed at {}", factory_id);
+
+    // Create repo via factory
+    let contract_id: AccountId = "repo.factory.sandbox".parse().unwrap();
+
+    Contract(factory_id.clone())
+        .call_function("create_repo", json!({ "repo_name": "repo" }))
+        .transaction()
+        .deposit(near_api::NearToken::from_near(5))
+        .with_signer(owner_id.clone(), owner_signer.clone())
+        .send_to(&network)
+        .await
+        .unwrap()
+        .assert_success();
+
+    info!("Repo created at {}", contract_id);
 
     let state = Arc::new(AppState {
         sandbox,

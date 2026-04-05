@@ -47,14 +47,6 @@ async fn run(contract_id_str: &str) {
 
     // Lazy-load signer credentials (only needed for push)
     let mut signer_cache: Option<(AccountId, Arc<Signer>)> = None;
-    let mut ensure_signer = || -> (AccountId, Arc<Signer>) {
-        if let Some(ref cached) = signer_cache {
-            return cached.clone();
-        }
-        let (_, signer_id, signer) = resolve_credentials(contract_id_str);
-        signer_cache = Some((signer_id.clone(), signer.clone()));
-        (signer_id, signer)
-    };
 
     let stdin = io::stdin();
     let mut lines = stdin.lock().lines();
@@ -107,7 +99,13 @@ async fn run(contract_id_str: &str) {
             write!(out, "\n").unwrap();
             out.flush().unwrap();
         } else if line.starts_with("push ") {
-            let (signer_id, signer) = ensure_signer();
+            let (signer_id, signer) = if let Some(ref cached) = signer_cache {
+                cached.clone()
+            } else {
+                let (_, sid, s) = resolve_credentials(contract_id_str, &network).await;
+                signer_cache = Some((sid.clone(), s.clone()));
+                (sid, s)
+            };
 
             let mut push_specs: Vec<String> = vec![line.clone()];
             while let Some(Ok(next_line)) = lines.next() {
@@ -150,17 +148,26 @@ fn resolve_network() -> near_api::NetworkConfig {
     near_api::NetworkConfig::from_rpc_url(&env, rpc_url.parse().unwrap())
 }
 
-fn resolve_credentials(contract_id_str: &str) -> (AccountId, AccountId, Arc<Signer>) {
+async fn resolve_credentials(contract_id_str: &str, network: &near_api::NetworkConfig) -> (AccountId, AccountId, Arc<Signer>) {
     let contract_id: AccountId = contract_id_str.parse().expect("invalid contract ID");
 
     // Check for signer@contract format
     let (signer_account, _contract) = if contract_id_str.contains('@') {
         let parts: Vec<&str> = contract_id_str.splitn(2, '@').collect();
         (parts[0].to_string(), parts[1].to_string())
-    } else {
-        let signer = std::env::var("NEAR_SIGNER_ACCOUNT")
-            .unwrap_or_else(|_| contract_id_str.to_string());
+    } else if let Ok(signer) = std::env::var("NEAR_SIGNER_ACCOUNT") {
         (signer, contract_id_str.to_string())
+    } else {
+        // Query the contract's owner to use as default signer
+        let owner = Contract(contract_id.clone())
+            .call_function("get_owner", json!({}))
+            .read_only::<String>()
+            .fetch_from(network)
+            .await
+            .map(|r| r.data)
+            .unwrap_or_else(|_| contract_id_str.to_string());
+        eprintln!("git-remote-near: using owner '{}' as signer", owner);
+        (owner, contract_id_str.to_string())
     };
     let signer_id: AccountId = signer_account.parse().expect("invalid signer account");
 
