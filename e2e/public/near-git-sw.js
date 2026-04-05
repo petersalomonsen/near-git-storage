@@ -15,6 +15,10 @@ import init, {
     apply_delta,
     git_sha1,
     create_signed_transaction,
+    borsh_encode_push_objects,
+    borsh_encode_shas,
+    borsh_decode_push_result,
+    borsh_decode_objects,
 } from './wasm-lib/wasm_lib.js';
 
 let config = null;
@@ -97,15 +101,36 @@ async function nearRpc(method, params) {
 }
 
 async function nearViewCall(method, args) {
+    // Borsh-encoded methods: get_objects
+    let argsBase64;
+    if (method === 'get_objects') {
+        const borshBytes = borsh_encode_shas(JSON.stringify(args.shas));
+        argsBase64 = uint8ToBase64(borshBytes);
+    } else {
+        argsBase64 = btoa(JSON.stringify(args));
+    }
+
     const json = await nearRpc('query', {
         request_type: 'call_function',
         finality: 'optimistic',
         account_id: config.contractId,
         method_name: method,
-        args_base64: btoa(JSON.stringify(args)),
+        args_base64: argsBase64,
     });
     if (json.error) throw new Error(JSON.stringify(json.error));
+
+    // Borsh-decoded results
+    if (method === 'get_objects') {
+        const resultBytes = new Uint8Array(json.result.result);
+        return JSON.parse(borsh_decode_objects(resultBytes));
+    }
     return JSON.parse(new TextDecoder().decode(new Uint8Array(json.result.result)));
+}
+
+function uint8ToBase64(bytes) {
+    let binary = '';
+    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    return btoa(binary);
 }
 
 async function nearFunctionCall(method, args) {
@@ -120,6 +145,14 @@ async function nearFunctionCall(method, args) {
     const nonce = accessKeyRes.result.nonce + 1;
     const blockHash = accessKeyRes.result.block_hash;
 
+    // Encode args: borsh for push_objects, JSON for others
+    let argsBytes;
+    if (method === 'push_objects') {
+        argsBytes = borsh_encode_push_objects(JSON.stringify(args.objects));
+    } else {
+        argsBytes = new TextEncoder().encode(JSON.stringify(args));
+    }
+
     // Create signed transaction using WASM module
     const signedTxBase64 = create_signed_transaction(
         config.accountId,
@@ -127,7 +160,7 @@ async function nearFunctionCall(method, args) {
         config.privateKey,
         config.contractId,
         method,
-        JSON.stringify(args),
+        argsBytes,
         BigInt(nonce),
         blockHash,
         BigInt(300_000_000_000_000), // 300 TGas
@@ -141,10 +174,18 @@ async function nearFunctionCall(method, args) {
     }
     const result = broadcastRes.result;
     if (result.status && result.status.SuccessValue !== undefined) {
-        const decoded = atob(result.status.SuccessValue);
+        const rawBytes = Uint8Array.from(atob(result.status.SuccessValue), c => c.charCodeAt(0));
+        // Borsh-decode for push_objects, JSON for others
+        let decoded;
+        if (method === 'push_objects') {
+            decoded = JSON.parse(borsh_decode_push_result(rawBytes));
+        } else {
+            const text = new TextDecoder().decode(rawBytes);
+            decoded = text ? JSON.parse(text) : null;
+        }
         return {
             success: true,
-            result: decoded ? JSON.parse(decoded) : null,
+            result: decoded,
             txHash: result.transaction.hash,
         };
     }

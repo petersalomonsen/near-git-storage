@@ -160,20 +160,20 @@ async fn test_factory_create_repo() {
 
     assert_eq!(owner, owner_id.to_string());
 
-    // Verify the repo is functional — push objects as the owner
+    // Verify the repo is functional — push objects as the owner (borsh-serialized)
+    #[derive(borsh::BorshSerialize)]
+    struct GitObject {
+        obj_type: String,
+        data: Vec<u8>,
+        base_sha: Option<String>,
+    }
+    let objects = vec![GitObject {
+        obj_type: "blob".to_string(),
+        data: b"hello from factory repo".to_vec(),
+        base_sha: None,
+    }];
     let result = Contract(repo_id.clone())
-        .call_function(
-            "push_objects",
-            json!({
-                "objects": [{
-                    "obj_type": "blob",
-                    "data": base64::Engine::encode(
-                        &base64::engine::general_purpose::STANDARD,
-                        b"hello from factory repo"
-                    )
-                }]
-            }),
-        )
+        .call_function_borsh("push_objects", &objects)
         .transaction()
         .with_signer(owner_id, owner_signer)
         .send_to(&s.network)

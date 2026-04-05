@@ -74,6 +74,123 @@ pub fn git_sha1(obj_type: &str, data: &[u8]) -> String {
     obj.sha1()
 }
 
+// --- Borsh encoding/decoding for contract methods ---
+
+/// Borsh-encode git objects for push_objects (JSON input with base64 data → borsh bytes).
+///
+/// Input: JSON array of `[{obj_type, data(base64), base_sha?}, ...]`
+/// Output: borsh-encoded `Vec<GitObject>` bytes
+#[wasm_bindgen]
+pub fn borsh_encode_push_objects(objects_json: &str) -> Result<Vec<u8>, String> {
+    let objects: Vec<serde_json::Value> =
+        serde_json::from_str(objects_json).map_err(|e| e.to_string())?;
+
+    let mut buf = Vec::new();
+    // Vec length
+    buf.extend_from_slice(&(objects.len() as u32).to_le_bytes());
+    for obj in &objects {
+        // obj_type: String
+        borsh_write_string(&mut buf, obj["obj_type"].as_str().unwrap_or("blob"));
+        // data: Vec<u8> (decode from base64)
+        let data_b64 = obj["data"].as_str().unwrap_or("");
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(data_b64)
+            .unwrap_or_default();
+        buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&data);
+        // base_sha: Option<String>
+        match obj.get("base_sha").and_then(|v| v.as_str()) {
+            Some(sha) => {
+                buf.push(1);
+                borsh_write_string(&mut buf, sha);
+            }
+            None => buf.push(0),
+        }
+    }
+    Ok(buf)
+}
+
+/// Borsh-encode SHA list for get_objects (JSON array → borsh bytes).
+///
+/// Input: JSON array of SHA strings `["abc123", ...]`
+/// Output: borsh-encoded `Vec<String>` bytes
+#[wasm_bindgen]
+pub fn borsh_encode_shas(shas_json: &str) -> Result<Vec<u8>, String> {
+    let shas: Vec<String> = serde_json::from_str(shas_json).map_err(|e| e.to_string())?;
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&(shas.len() as u32).to_le_bytes());
+    for sha in &shas {
+        borsh_write_string(&mut buf, sha);
+    }
+    Ok(buf)
+}
+
+/// Decode borsh PushObjectsResult → JSON string `{"shas":["..."]}`
+#[wasm_bindgen]
+pub fn borsh_decode_push_result(data: &[u8]) -> Result<String, String> {
+    let mut pos = 0;
+    let shas = borsh_read_string_vec(data, &mut pos)?;
+    serde_json::to_string(&serde_json::json!({ "shas": shas })).map_err(|e| e.to_string())
+}
+
+/// Decode borsh get_objects result → JSON string
+/// `[[sha, {obj_type, data(base64)}], [sha, null], ...]`
+#[wasm_bindgen]
+pub fn borsh_decode_objects(data: &[u8]) -> Result<String, String> {
+    let mut pos = 0;
+    let len = borsh_read_u32(data, &mut pos)? as usize;
+    let mut result = Vec::new();
+    for _ in 0..len {
+        let sha = borsh_read_string(data, &mut pos)?;
+        let option_tag = borsh_read_u8(data, &mut pos)?;
+        if option_tag == 1 {
+            let obj_type = borsh_read_string(data, &mut pos)?;
+            let obj_data = borsh_read_bytes(data, &mut pos)?;
+            let data_b64 = base64::engine::general_purpose::STANDARD.encode(&obj_data);
+            result.push(serde_json::json!([sha, { "obj_type": obj_type, "data": data_b64 }]));
+        } else {
+            result.push(serde_json::json!([sha, null]));
+        }
+    }
+    serde_json::to_string(&result).map_err(|e| e.to_string())
+}
+
+fn borsh_read_u8(data: &[u8], pos: &mut usize) -> Result<u8, String> {
+    if *pos >= data.len() { return Err("unexpected end of borsh data".into()); }
+    let v = data[*pos];
+    *pos += 1;
+    Ok(v)
+}
+
+fn borsh_read_u32(data: &[u8], pos: &mut usize) -> Result<u32, String> {
+    if *pos + 4 > data.len() { return Err("unexpected end of borsh data".into()); }
+    let v = u32::from_le_bytes(data[*pos..*pos + 4].try_into().unwrap());
+    *pos += 4;
+    Ok(v)
+}
+
+fn borsh_read_bytes(data: &[u8], pos: &mut usize) -> Result<Vec<u8>, String> {
+    let len = borsh_read_u32(data, pos)? as usize;
+    if *pos + len > data.len() { return Err("unexpected end of borsh data".into()); }
+    let v = data[*pos..*pos + len].to_vec();
+    *pos += len;
+    Ok(v)
+}
+
+fn borsh_read_string(data: &[u8], pos: &mut usize) -> Result<String, String> {
+    let bytes = borsh_read_bytes(data, pos)?;
+    String::from_utf8(bytes).map_err(|e| e.to_string())
+}
+
+fn borsh_read_string_vec(data: &[u8], pos: &mut usize) -> Result<Vec<String>, String> {
+    let len = borsh_read_u32(data, pos)? as usize;
+    let mut result = Vec::with_capacity(len);
+    for _ in 0..len {
+        result.push(borsh_read_string(data, pos)?);
+    }
+    Ok(result)
+}
+
 // --- NEAR transaction signing ---
 
 /// Create a signed NEAR function call transaction, returned as base64.
@@ -83,7 +200,7 @@ pub fn git_sha1(obj_type: &str, data: &[u8]) -> String {
 /// - `private_key_b58`: base58-encoded ed25519 private key (without "ed25519:" prefix)
 /// - `receiver_id`: contract account, e.g. "repo.near"
 /// - `method_name`: e.g. "push_objects"
-/// - `args_json`: JSON string of method arguments
+/// - `args`: raw method argument bytes (borsh or JSON depending on method)
 /// - `nonce`: access key nonce + 1
 /// - `block_hash_b58`: recent block hash in base58
 /// - `gas`: gas to attach (e.g. 300000000000000 = 300 TGas)
@@ -95,7 +212,7 @@ pub fn create_signed_transaction(
     private_key_b58: &str,
     receiver_id: &str,
     method_name: &str,
-    args_json: &str,
+    args: &[u8],
     nonce: u64,
     block_hash_b58: &str,
     gas: u64,
@@ -165,7 +282,6 @@ pub fn create_signed_transaction(
     // method_name: String
     borsh_write_string(&mut tx_bytes, method_name);
     // args: Vec<u8>
-    let args = args_json.as_bytes();
     tx_bytes.extend_from_slice(&(args.len() as u32).to_le_bytes());
     tx_bytes.extend_from_slice(args);
     // gas: u64 LE

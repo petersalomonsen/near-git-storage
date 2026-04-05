@@ -1003,7 +1003,7 @@ dependencies = [
 name = "git-remote-near"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
+ "borsh",
  "git-core",
  "near-api",
  "serde",
@@ -1017,6 +1017,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
+ "borsh",
  "git-core",
  "near-api",
  "near-sandbox",
@@ -1787,6 +1788,7 @@ name = "near-git-storage"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "borsh",
  "near-api",
  "near-sandbox",
  "near-sdk",

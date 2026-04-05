@@ -16,11 +16,32 @@
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 
-use base64::Engine;
+use borsh::{BorshDeserialize, BorshSerialize};
 use near_api::{AccountId, Contract, Signer};
 use serde_json::json;
 
 use git_core::packfile;
+
+/// Borsh-serialized git object for push_objects calls.
+#[derive(BorshSerialize)]
+struct GitObject {
+    obj_type: String,
+    data: Vec<u8>,
+    base_sha: Option<String>,
+}
+
+/// Borsh-deserialized push_objects result.
+#[derive(BorshDeserialize)]
+struct PushObjectsResult {
+    shas: Vec<String>,
+}
+
+/// Borsh-deserialized object from get_objects.
+#[derive(BorshDeserialize)]
+struct RetrievedObject {
+    obj_type: String,
+    data: Vec<u8>,
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -235,9 +256,10 @@ async fn do_fetch(
         visited.insert(sha.clone());
         needed.push(sha.clone());
 
-        let objects: Vec<(String, Option<serde_json::Value>)> = Contract(contract_id.clone())
-            .call_function("get_objects", json!({ "shas": [&sha] }))
-            .read_only()
+        let shas_query = vec![sha.clone()];
+        let objects: Vec<(String, Option<RetrievedObject>)> = Contract(contract_id.clone())
+            .call_function_borsh("get_objects", &shas_query)
+            .read_only_borsh()
             .fetch_from(network)
             .await
             .unwrap()
@@ -245,15 +267,9 @@ async fn do_fetch(
 
         for (_sha, maybe_obj) in objects {
             if let Some(obj) = maybe_obj {
-                let obj_type = obj["obj_type"].as_str().unwrap_or("");
-                let data_b64 = obj["data"].as_str().unwrap_or("");
-                let data = base64::engine::general_purpose::STANDARD
-                    .decode(data_b64)
-                    .unwrap_or_default();
-
-                match obj_type {
+                match obj.obj_type.as_str() {
                     "commit" => {
-                        let text = String::from_utf8_lossy(&data);
+                        let text = String::from_utf8_lossy(&obj.data);
                         for line in text.lines() {
                             if let Some(tree_sha) = line.strip_prefix("tree ") {
                                 queue.push_back(tree_sha.trim().to_string());
@@ -266,14 +282,14 @@ async fn do_fetch(
                     }
                     "tree" => {
                         let mut pos = 0;
-                        while pos < data.len() {
-                            let null_pos = data[pos..]
+                        while pos < obj.data.len() {
+                            let null_pos = obj.data[pos..]
                                 .iter()
                                 .position(|&b| b == 0)
                                 .map(|p| pos + p);
                             if let Some(null_pos) = null_pos {
-                                if null_pos + 21 <= data.len() {
-                                    let child_sha: String = data[null_pos + 1..null_pos + 21]
+                                if null_pos + 21 <= obj.data.len() {
+                                    let child_sha: String = obj.data[null_pos + 1..null_pos + 21]
                                         .iter()
                                         .map(|b| format!("{:02x}", b))
                                         .collect();
@@ -298,9 +314,10 @@ async fn do_fetch(
     // Fetch all objects in batches
     let mut pack_objects = Vec::new();
     for chunk in needed.chunks(50) {
-        let objects: Vec<(String, Option<serde_json::Value>)> = Contract(contract_id.clone())
-            .call_function("get_objects", json!({ "shas": chunk }))
-            .read_only()
+        let shas_query: Vec<String> = chunk.to_vec();
+        let objects: Vec<(String, Option<RetrievedObject>)> = Contract(contract_id.clone())
+            .call_function_borsh("get_objects", &shas_query)
+            .read_only_borsh()
             .fetch_from(network)
             .await
             .unwrap()
@@ -308,12 +325,10 @@ async fn do_fetch(
 
         for (_sha, maybe_obj) in objects {
             if let Some(obj) = maybe_obj {
-                let obj_type = obj["obj_type"].as_str().unwrap_or("blob").to_string();
-                let data_b64 = obj["data"].as_str().unwrap_or("");
-                let data = base64::engine::general_purpose::STANDARD
-                    .decode(data_b64)
-                    .unwrap_or_default();
-                pack_objects.push(packfile::PackObject { obj_type, data });
+                pack_objects.push(packfile::PackObject {
+                    obj_type: obj.obj_type,
+                    data: obj.data,
+                });
             }
         }
     }
@@ -520,19 +535,18 @@ async fn do_push(
             op.dst_ref
         );
 
-        // Push objects to contract
-        let git_objects: Vec<serde_json::Value> = to_push
+        // Push objects to contract (borsh-serialized)
+        let git_objects: Vec<GitObject> = to_push
             .iter()
-            .map(|obj| {
-                json!({
-                    "obj_type": obj.obj_type,
-                    "data": base64::engine::general_purpose::STANDARD.encode(&obj.data),
-                })
+            .map(|obj| GitObject {
+                obj_type: obj.obj_type.clone(),
+                data: obj.data.clone(),
+                base_sha: None,
             })
             .collect();
 
         let push_result = Contract(contract_id.clone())
-            .call_function("push_objects", json!({ "objects": git_objects }))
+            .call_function_borsh("push_objects", &git_objects)
             .transaction()
             .with_signer(signer_id.clone(), signer.clone())
             .send_to(network)
@@ -546,14 +560,8 @@ async fn do_push(
                     continue;
                 }
                 let full = r.into_full().unwrap();
-                let data: serde_json::Value = full.json().unwrap_or(json!(null));
-                let shas: Vec<String> = data["shas"]
-                    .as_array()
-                    .unwrap_or(&Vec::new())
-                    .iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect();
-                (tx_hash, shas)
+                let data: PushObjectsResult = full.borsh().unwrap();
+                (tx_hash, data.shas)
             }
             Err(e) => {
                 results.push(format!("error {} {}", op.dst_ref, e));
