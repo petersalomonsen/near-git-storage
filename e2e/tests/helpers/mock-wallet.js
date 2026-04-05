@@ -2,16 +2,17 @@
  * Mock wallet for NearConnect in E2E tests.
  *
  * Intercepts the NearConnect manifest to inject a mock wallet that signs
- * transactions directly using the sandbox genesis key. This avoids needing
- * a real wallet extension or popup flow.
+ * transactions using the sandbox genesis key via the git-server's RPC proxy.
  */
 
 export const MOCK_MANIFEST_ID = 'mock-wallet';
 
 /**
  * The mock wallet executor JS. Runs inside NearConnect's sandboxed iframe.
- * For signAndSendTransaction, it signs and broadcasts directly to sandbox RPC
- * using the genesis private key.
+ *
+ * For signAndSendTransaction, it uses the near-api-js UMD bundle loaded
+ * via importScripts (available in the sandbox iframe context) to sign and
+ * broadcast transactions with the genesis key.
  */
 export function createMockExecutorJs(rpcUrl) {
     return `(function() {
@@ -36,49 +37,22 @@ export function createMockExecutorJs(rpcUrl) {
     async signMessage()  { throw new Error('Not supported'); },
     async signAndSendTransaction(p) {
       const accountId = window.sandboxedLocalStorage.getItem('signedAccountId') || '';
-      try {
-        // Import near-api-js from CDN for signing
-        const { connect, keyStores, KeyPair, utils } = await import('https://cdn.jsdelivr.net/npm/near-api-js@5.1.1/+esm');
 
-        const keyStore = new keyStores.InMemoryKeyStore();
-        await keyStore.setKey('sandbox', accountId, KeyPair.fromString(GENESIS_PRIVATE_KEY));
-
-        const near = await connect({
-          networkId: 'sandbox',
-          nodeUrl: RPC_URL,
-          keyStore,
-        });
-
-        const account = await near.account(accountId);
-
-        const nearActions = (p.actions || []).map(a => {
-          if (a.type === 'FunctionCall') {
-            const args = typeof a.params.args === 'object' && !(a.params.args instanceof Uint8Array)
-              ? JSON.stringify(a.params.args)
-              : a.params.args;
-            return {
-              type: 'FunctionCall',
-              params: {
-                methodName: a.params.methodName,
-                args: typeof args === 'string' ? new TextEncoder().encode(args) : args,
-                gas: BigInt(a.params.gas || '100000000000000'),
-                deposit: BigInt(a.params.deposit || '0'),
-              }
-            };
-          }
-          return a;
-        });
-
-        const result = await account.signAndSendTransaction({
+      // Use the test signing endpoint on the git-server
+      const resp = await fetch('/_test/sign-and-send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          signerId: accountId,
           receiverId: p.receiverId,
-          actions: nearActions,
-        });
-
-        return result;
-      } catch (err) {
-        console.error('[mock-wallet] signAndSendTransaction error:', err);
-        throw err;
+          actions: p.actions,
+        }),
+      });
+      if (!resp.ok) {
+        const text = await resp.text();
+        throw new Error('Sign and send failed: ' + text);
       }
+      return resp.json();
     },
     async signAndSendTransactions(p) {
       const results = [];

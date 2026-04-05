@@ -90,7 +90,7 @@
             connector.on('wallet:signIn', async (event) => {
                 const accounts = event.accounts || [];
                 if (accounts.length > 0) {
-                    wallet = connector.wallet();
+                    wallet = event.wallet || await connector.wallet();
                     signAndSendTransaction = (p) => wallet.signAndSendTransaction(p);
                     onConnected(accounts[0].accountId);
                 }

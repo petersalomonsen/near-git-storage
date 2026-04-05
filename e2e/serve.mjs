@@ -1,6 +1,10 @@
 import http from 'http';
 import fs from 'fs';
 import path from 'path';
+import { createHash } from 'crypto';
+import { KeyPair } from '@near-js/crypto';
+import { actionCreators, createTransaction, Signature, SignedTransaction } from '@near-js/transactions';
+import bs58 from 'bs58';
 
 const PORT = process.env.WEB_APP_PORT || 8081;
 const GIT_SERVER_PORT = process.env.GIT_SERVER_PORT || 8080;
@@ -84,6 +88,63 @@ async function proxyToNearRpc(req, res) {
     req.pipe(proxyReq);
 }
 
+// Genesis key for sandbox signing
+const GENESIS_PRIVATE_KEY = 'ed25519:3tgdk2wPraJzT4nsTuf86UX41xgPNk3MHnq8epARMdBNs29AFEztAuaQ7iHddDfXG9F2RzV1XNQYgJyAyoW51UBB';
+const GENESIS_KEY_PAIR = KeyPair.fromString(GENESIS_PRIVATE_KEY);
+
+async function signAndSendTransaction({ signerId, receiverId, actions }) {
+    const rpcUrl = await resolveNearRpcUrl();
+    if (!rpcUrl) throw new Error('Sandbox RPC not available');
+
+    const rpc = async (method, params) => {
+        const resp = await fetch(rpcUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+        });
+        return resp.json();
+    };
+
+    // Get access key nonce
+    const keyData = await rpc('query', {
+        request_type: 'view_access_key',
+        finality: 'final',
+        account_id: signerId,
+        public_key: GENESIS_KEY_PAIR.getPublicKey().toString(),
+    });
+    if (!keyData.result) throw new Error(`No access key for ${signerId}`);
+    const nonce = keyData.result.nonce + 1;
+    const blockHash = bs58.decode(keyData.result.block_hash);
+
+    // Build actions
+    const nearActions = actions.map(a => {
+        if (a.type === 'FunctionCall') {
+            const args = typeof a.params.args === 'string'
+                ? Buffer.from(a.params.args, 'base64')
+                : Buffer.from(JSON.stringify(a.params.args));
+            return actionCreators.functionCall(
+                a.params.methodName,
+                args,
+                BigInt(a.params.gas || '100000000000000'),
+                BigInt(a.params.deposit || '0'),
+            );
+        }
+        throw new Error('Unsupported action type: ' + a.type);
+    });
+
+    const tx = createTransaction(signerId, GENESIS_KEY_PAIR.getPublicKey(), receiverId, nonce, nearActions, blockHash);
+    const serialized = tx.encode();
+    const hash = createHash('sha256').update(serialized).digest();
+    const signed = GENESIS_KEY_PAIR.sign(hash);
+    const sig = new Signature({ keyType: 0, data: signed.signature });
+    const signedTx = new SignedTransaction({ transaction: tx, signature: sig });
+
+    const result = await rpc('broadcast_tx_commit', [Buffer.from(signedTx.encode()).toString('base64')]);
+    if (result.error) throw new Error(JSON.stringify(result.error));
+    if (result.result?.status?.Failure) throw new Error(JSON.stringify(result.result.status.Failure));
+    return result.result;
+}
+
 http.createServer((req, res) => {
     const urlPath = (req.url || '/').split('?')[0];
 
@@ -114,6 +175,23 @@ http.createServer((req, res) => {
     // Proxy NEAR RPC requests
     if (urlPath === '/near-rpc') {
         proxyToNearRpc(req, res);
+        return;
+    }
+
+    // Test endpoint: sign and send a transaction using genesis key
+    if (urlPath === '/_test/sign-and-send' && req.method === 'POST') {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', async () => {
+            try {
+                const result = await signAndSendTransaction(JSON.parse(body));
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify(result));
+            } catch (err) {
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: err.message }));
+            }
+        });
         return;
     }
 

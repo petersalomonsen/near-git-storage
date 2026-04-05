@@ -11,7 +11,6 @@ const USER_ID = 'alice.sandbox';
 
 test.describe('Create Repository via Factory', () => {
     test.beforeAll(async () => {
-        // Create test user account (git-server already started the sandbox)
         try {
             await createAccount(USER_ID, 'sandbox', 20);
         } catch (e) {
@@ -20,7 +19,7 @@ test.describe('Create Repository via Factory', () => {
     });
 
     test('create a new repo through the UI', async ({ page }) => {
-        // Navigate with sandbox mode (uses near-api-js directly, no wallet needed)
+        // Use sandbox-direct mode for reliable e2e testing
         await page.goto(
             `/create-repo?factory=${FACTORY_ID}&sandbox=true&account=${USER_ID}&rpc=/near-rpc`
         );
@@ -30,10 +29,8 @@ test.describe('Create Repository via Factory', () => {
             timeout: 30000,
         });
 
-        // Fill in repo name
+        // Fill in repo name and create
         await page.fill('#repo-name', 'my-test-repo');
-
-        // Click create
         await page.click('#create-btn');
 
         // Wait for success
@@ -42,7 +39,7 @@ test.describe('Create Repository via Factory', () => {
             `my-test-repo.${FACTORY_ID}`,
         );
 
-        // Verify on-chain: the repo contract exists and owner is the user
+        // Verify on-chain: repo exists with correct owner
         const owner = await viewFunction(
             `my-test-repo.${FACTORY_ID}`,
             'get_owner',
