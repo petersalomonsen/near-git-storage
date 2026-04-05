@@ -2,3 +2,4 @@
 /res
 .env
 test-results/
+.wrangler/

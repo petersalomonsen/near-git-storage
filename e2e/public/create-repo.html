@@ -34,7 +34,7 @@
         <label for="repo-name">Repository name</label>
         <input type="text" id="repo-name" placeholder="my-project">
         <label for="factory-id" style="margin-top: 0.5rem;">Factory contract</label>
-        <input type="text" id="factory-id" placeholder="factory.near" style="width:100%;box-sizing:border-box;padding:0.4rem;font-family:monospace;margin-bottom:0.5rem;">
+        <input type="text" id="factory-id" value="gitfactory.testnet" placeholder="factory.near" style="width:100%;box-sizing:border-box;padding:0.4rem;font-family:monospace;margin-bottom:0.5rem;">
         <button id="create-btn">Create Repository</button>
     </div>
 
@@ -84,7 +84,7 @@
 
         async function initNearConnect() {
             const { NearConnector } = await import('https://cdn.jsdelivr.net/npm/@hot-labs/near-connect@0.11.1/+esm');
-            const network = params.get('network') || 'mainnet';
+            const network = params.get('network') || 'testnet';
             connector = new NearConnector({ network });
 
             connector.on('wallet:signIn', async (event) => {
