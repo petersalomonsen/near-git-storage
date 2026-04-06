@@ -1,3 +1,4 @@
+use std::io::Write as _;
 use std::sync::{Arc, atomic::{AtomicU32, Ordering}};
 
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -9,25 +10,15 @@ use tokio::sync::OnceCell;
 const WASM_FILEPATH: &str = "res/near_git_storage.wasm";
 const FACTORY_WASM: &str = "res/near_git_factory.wasm";
 
-/// Counter for generating unique account names per test.
 static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
-
-/// Shared sandbox instance across all tests.
 static SHARED_SANDBOX: OnceCell<SharedSandbox> = OnceCell::const_new();
 
-/// Test-side mirror of the contract's GitObject (borsh-serialized).
+/// Borsh-serialized ref update (matches contract's RefUpdate).
 #[derive(BorshSerialize, BorshDeserialize, Clone)]
-struct GitObject {
-    sha: String,
-    obj_type: String,
-    data: Vec<u8>,
-}
-
-/// Test-side mirror of RetrievedObject (borsh-deserialized).
-#[derive(BorshSerialize, BorshDeserialize)]
-struct RetrievedObject {
-    obj_type: String,
-    data: Vec<u8>,
+struct RefUpdate {
+    name: String,
+    old_sha: Option<String>,
+    new_sha: String,
 }
 
 struct SharedSandbox {
@@ -39,8 +30,8 @@ struct SharedSandbox {
     #[allow(dead_code)]
     wasm: Vec<u8>,
     factory_wasm: Vec<u8>,
+    #[allow(dead_code)]
     global_id: AccountId,
-    /// SHA-256 hash of the git-storage WASM (hex string)
     wasm_hash: String,
 }
 
@@ -59,18 +50,16 @@ async fn get_shared_sandbox() -> &'static SharedSandbox {
                 Signer::from_secret_key(genesis.private_key.parse().unwrap()).unwrap();
 
             let wasm = std::fs::read(WASM_FILEPATH)
-                .expect("Contract WASM not found. Run `./build.sh` first to build the contract.");
+                .expect("Contract WASM not found. Run `./build.sh` first.");
             let factory_wasm = std::fs::read(FACTORY_WASM)
                 .expect("Factory WASM not found. Run `./build.sh` first.");
 
-            // Compute SHA-256 hash of git-storage WASM for hash-based global contract
             use sha2::{Digest, Sha256};
             let wasm_hash: String = Sha256::digest(&wasm)
                 .iter()
                 .map(|b| format!("{:02x}", b))
                 .collect();
 
-            // Deploy git-storage WASM as a global contract tied to a "global" account
             let global_secret = near_api::signer::generate_secret_key().unwrap();
             let global_id: AccountId = "global.sandbox".parse().unwrap();
 
@@ -83,48 +72,20 @@ async fn get_shared_sandbox() -> &'static SharedSandbox {
                 .unwrap()
                 .assert_success();
 
-            let global_signer = Signer::from_secret_key(global_secret).unwrap();
-
             Contract::deploy_global_contract_code(wasm.clone())
                 .as_hash()
-                .with_signer(global_id.clone(), global_signer)
+                .with_signer(global_id.clone(), Signer::from_secret_key(global_secret).unwrap())
                 .send_to(&network)
                 .await
                 .unwrap()
                 .assert_success();
 
             SharedSandbox {
-                sandbox,
-                network,
-                genesis_id,
-                genesis_signer,
-                wasm,
-                factory_wasm,
-                global_id,
-                wasm_hash,
+                sandbox, network, genesis_id, genesis_signer,
+                wasm, factory_wasm, global_id, wasm_hash,
             }
         })
         .await
-}
-
-/// Helper: compute git SHA-1 for a raw object (same algorithm as git).
-fn git_sha(obj_type: &str, data: &[u8]) -> String {
-    use sha1::{Digest, Sha1};
-    let header = format!("{} {}\0", obj_type, data.len());
-    let mut hasher = Sha1::new();
-    hasher.update(header.as_bytes());
-    hasher.update(data);
-    let result = hasher.finalize();
-    result.iter().map(|b| format!("{:02x}", b)).collect()
-}
-
-/// Build a GitObject (SHA computed client-side).
-fn blob(data: &[u8]) -> GitObject {
-    GitObject {
-        sha: git_sha("blob", data),
-        obj_type: "blob".to_string(),
-        data: data.to_vec(),
-    }
 }
 
 struct TestContext {
@@ -134,13 +95,10 @@ struct TestContext {
     contract_id: AccountId,
 }
 
-/// Set up a fresh contract + owner within the shared sandbox.
-/// Deploys the factory, then creates a repo via the factory.
 async fn setup() -> TestContext {
     let shared = get_shared_sandbox().await;
     let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
 
-    // Create owner account
     let owner_secret = near_api::signer::generate_secret_key().unwrap();
     let owner_id: AccountId = format!("owner{n}.sandbox").parse().unwrap();
 
@@ -155,7 +113,6 @@ async fn setup() -> TestContext {
 
     let owner_signer = Signer::from_secret_key(owner_secret).unwrap();
 
-    // Deploy factory
     let factory_secret = near_api::signer::generate_secret_key().unwrap();
     let factory_id: AccountId = format!("factory{n}.sandbox").parse().unwrap();
 
@@ -178,7 +135,6 @@ async fn setup() -> TestContext {
         .unwrap()
         .assert_success();
 
-    // Create repo via factory
     let repo_name = format!("repo{n}");
     Contract(factory_id.clone())
         .call_function("create_repo", json!({ "repo_name": repo_name }))
@@ -192,35 +148,15 @@ async fn setup() -> TestContext {
 
     let contract_id: AccountId = format!("{}.{}", repo_name, factory_id).parse().unwrap();
 
-    TestContext {
-        network: shared.network.clone(),
-        owner_id,
-        owner_signer,
-        contract_id,
-    }
+    TestContext { network: shared.network.clone(), owner_id, owner_signer, contract_id }
 }
 
 impl TestContext {
-    /// Call a JSON contract method as the owner.
-    async fn owner_call(
-        &self,
-        method: &str,
-        args: serde_json::Value,
-    ) -> near_api::types::transaction::result::TransactionResult {
+    async fn push_pack(&self, pack_data: &[u8], ref_updates: &[RefUpdate]) {
         Contract(self.contract_id.clone())
-            .call_function(method, args)
+            .call_function_borsh("push", (pack_data, ref_updates))
             .transaction()
-            .with_signer(self.owner_id.clone(), self.owner_signer.clone())
-            .send_to(&self.network)
-            .await
-            .unwrap()
-    }
-
-    /// Push git objects via borsh.
-    async fn push_objects(&self, objects: Vec<GitObject>) {
-        Contract(self.contract_id.clone())
-            .call_function_borsh("push_objects", &objects)
-            .transaction()
+            .gas(near_api::NearGas::from_tgas(300))
             .with_signer(self.owner_id.clone(), self.owner_signer.clone())
             .send_to(&self.network)
             .await
@@ -228,51 +164,40 @@ impl TestContext {
             .assert_success();
     }
 
-    /// Push git objects via borsh, return raw TransactionResult.
-    async fn push_objects_raw(
-        &self,
-        objects: Vec<GitObject>,
-    ) -> near_api::types::transaction::result::TransactionResult {
+    async fn get_packs(&self, from_index: u32) -> Vec<Vec<u8>> {
         Contract(self.contract_id.clone())
-            .call_function_borsh("push_objects", &objects)
-            .transaction()
-            .with_signer(self.owner_id.clone(), self.owner_signer.clone())
-            .send_to(&self.network)
-            .await
-            .unwrap()
-    }
-
-    /// Retrieve objects by SHA via borsh view call.
-    async fn get_objects(&self, shas: Vec<String>) -> Vec<(String, Option<RetrievedObject>)> {
-        Contract(self.contract_id.clone())
-            .call_function_borsh("get_objects", &shas)
-            .read_only_borsh::<Vec<(String, Option<RetrievedObject>)>>()
+            .call_function_borsh("get_packs", &from_index)
+            .read_only_borsh::<Vec<Vec<u8>>>()
             .fetch_from(&self.network)
             .await
             .unwrap()
             .data
     }
 
-    /// Call a JSON view method with no args and deserialize the result.
-    async fn view_no_args<T: serde::de::DeserializeOwned + Send + Sync>(&self, method: &str) -> T {
+    async fn get_pack_count(&self) -> u32 {
         Contract(self.contract_id.clone())
-            .call_function(method, json!({}))
-            .read_only::<T>()
+            .call_function("get_pack_count", json!({}))
+            .read_only::<u32>()
             .fetch_from(&self.network)
             .await
             .unwrap()
             .data
     }
 
-    /// Call a JSON view method with args and deserialize the result.
-    async fn view<T: serde::de::DeserializeOwned + Send + Sync>(
-        &self,
-        method: &str,
-        args: serde_json::Value,
-    ) -> T {
+    async fn get_storage_bytes(&self) -> u64 {
+        near_api::Account(self.contract_id.clone())
+            .view()
+            .fetch_from(&self.network)
+            .await
+            .unwrap()
+            .data
+            .storage_usage
+    }
+
+    async fn get_refs(&self) -> Vec<(String, String)> {
         Contract(self.contract_id.clone())
-            .call_function(method, args)
-            .read_only::<T>()
+            .call_function("get_refs", json!({}))
+            .read_only::<Vec<(String, String)>>()
             .fetch_from(&self.network)
             .await
             .unwrap()
@@ -281,199 +206,282 @@ impl TestContext {
 }
 
 #[tokio::test]
-async fn test_push_and_retrieve_object() {
+async fn test_push_pack_and_retrieve() {
     let ctx = setup().await;
 
-    let data = b"hello world";
-    let obj = blob(data);
-    let sha = obj.sha.clone();
+    let pack_data = b"PACK\x00\x00\x00\x02\x00\x00\x00\x00fake-pack-data-here";
+    let ref_updates = vec![RefUpdate {
+        name: "refs/heads/main".to_string(),
+        old_sha: None,
+        new_sha: "aaaa000000000000000000000000000000000001".to_string(),
+    }];
 
-    ctx.push_objects(vec![obj]).await;
+    ctx.push_pack(pack_data, &ref_updates).await;
 
-    let objects = ctx.get_objects(vec![sha.clone()]).await;
-    assert_eq!(objects.len(), 1);
-    let retrieved = objects[0].1.as_ref().unwrap();
-    assert_eq!(retrieved.obj_type, "blob");
-    assert_eq!(retrieved.data, data);
-}
-
-#[tokio::test]
-async fn test_push_multiple_objects() {
-    let ctx = setup().await;
-
-    let obj1 = blob(b"file one");
-    let obj2 = blob(b"file two");
-    let sha1 = obj1.sha.clone();
-    let sha2 = obj2.sha.clone();
-
-    ctx.push_objects(vec![obj1, obj2]).await;
-
-    let objects = ctx.get_objects(vec![sha1.clone(), sha2.clone()]).await;
-    assert_eq!(objects.len(), 2);
-    assert_eq!(objects[0].1.as_ref().unwrap().data, b"file one");
-    assert_eq!(objects[1].1.as_ref().unwrap().data, b"file two");
-}
-
-#[tokio::test]
-async fn test_register_push_stores_mappings_and_updates_refs() {
-    let ctx = setup().await;
-
-    let obj = blob(b"hello world");
-    let sha = obj.sha.clone();
-
-    let push_result = ctx.push_objects_raw(vec![obj]).await;
-    let full = push_result.into_full().unwrap();
-    let tx_hash = full.outcome().transaction_hash.to_string();
-    full.assert_success();
-
-    ctx.owner_call(
-        "register_push",
-        json!({
-            "tx_hash": tx_hash,
-            "object_shas": [&sha],
-            "ref_updates": [{
-                "name": "refs/heads/main",
-                "old_sha": null,
-                "new_sha": &sha
-            }]
-        }),
-    )
-    .await
-    .assert_success();
-
-    let refs: Vec<(String, String)> = ctx.view_no_args("get_refs").await;
+    // Verify refs
+    let refs = ctx.get_refs().await;
     assert_eq!(refs.len(), 1);
     assert_eq!(refs[0].0, "refs/heads/main");
-    assert_eq!(refs[0].1, sha);
+    assert_eq!(refs[0].1, "aaaa000000000000000000000000000000000001");
 
-    let locations: Vec<(String, Option<String>)> = ctx
-        .view("get_object_locations", json!({ "shas": [&sha] }))
-        .await;
-    assert_eq!(locations[0].1, Some(tx_hash));
+    // Verify pack count
+    assert_eq!(ctx.get_pack_count().await, 1);
+
+    // Verify pack data
+    let packs = ctx.get_packs(0).await;
+    assert_eq!(packs.len(), 1);
+    assert_eq!(packs[0], pack_data);
 }
 
 #[tokio::test]
-async fn test_ref_update_cas_rejects_stale_old_sha() {
+async fn test_incremental_packs() {
     let ctx = setup().await;
 
-    let obj1 = blob(b"version 1");
-    let sha1 = obj1.sha.clone();
+    // Push pack 1
+    ctx.push_pack(b"pack-one", &[RefUpdate {
+        name: "refs/heads/main".to_string(),
+        old_sha: None,
+        new_sha: "aaaa000000000000000000000000000000000001".to_string(),
+    }]).await;
 
-    let push_result = ctx.push_objects_raw(vec![obj1]).await;
-    let tx_hash1 = push_result.into_full().unwrap().outcome().transaction_hash.to_string();
+    // Push pack 2
+    ctx.push_pack(b"pack-two", &[RefUpdate {
+        name: "refs/heads/main".to_string(),
+        old_sha: Some("aaaa000000000000000000000000000000000001".to_string()),
+        new_sha: "aaaa000000000000000000000000000000000002".to_string(),
+    }]).await;
 
-    ctx.owner_call(
-        "register_push",
-        json!({
-            "tx_hash": tx_hash1,
-            "object_shas": [&sha1],
-            "ref_updates": [{ "name": "refs/heads/main", "old_sha": null, "new_sha": &sha1 }]
-        }),
-    )
-    .await
-    .assert_success();
+    assert_eq!(ctx.get_pack_count().await, 2);
 
-    let obj2 = blob(b"version 2");
-    let sha2 = obj2.sha.clone();
-    let push_result2 = ctx.push_objects_raw(vec![obj2]).await;
-    let tx_hash2 = push_result2.into_full().unwrap().outcome().transaction_hash.to_string();
+    // Get all packs
+    let all = ctx.get_packs(0).await;
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0], b"pack-one");
+    assert_eq!(all[1], b"pack-two");
 
-    let result = ctx
-        .owner_call(
-            "register_push",
-            json!({
-                "tx_hash": tx_hash2,
-                "object_shas": [&sha2],
-                "ref_updates": [{
-                    "name": "refs/heads/main",
-                    "old_sha": "0000000000000000000000000000000000000000",
-                    "new_sha": &sha2
-                }]
-            }),
-        )
-        .await;
-
-    assert!(result.is_failure(), "Expected CAS failure");
-
-    let refs: Vec<(String, String)> = ctx.view_no_args("get_refs").await;
-    assert_eq!(refs[0].1, sha1);
+    // Get only new packs (incremental)
+    let new_only = ctx.get_packs(1).await;
+    assert_eq!(new_only.len(), 1);
+    assert_eq!(new_only[0], b"pack-two");
 }
 
 #[tokio::test]
-async fn test_non_owner_cannot_push() {
+async fn test_empty_push_updates_refs() {
     let ctx = setup().await;
-    let shared = get_shared_sandbox().await;
 
-    let non_owner_secret = near_api::signer::generate_secret_key().unwrap();
-    let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-    let non_owner_id: AccountId = format!("nonowner{n}.sandbox").parse().unwrap();
+    // Push with data first
+    ctx.push_pack(b"pack-data", &[RefUpdate {
+        name: "refs/heads/main".to_string(),
+        old_sha: None,
+        new_sha: "aaaa000000000000000000000000000000000001".to_string(),
+    }]).await;
 
-    near_api::Account::create_account(non_owner_id.clone())
-        .fund_myself(shared.genesis_id.clone(), NearToken::from_near(10))
-        .with_public_key(non_owner_secret.public_key())
-        .with_signer(shared.genesis_signer.clone())
-        .send_to(&ctx.network)
-        .await
-        .unwrap()
-        .assert_success();
+    // Empty push just updates ref
+    ctx.push_pack(b"", &[RefUpdate {
+        name: "refs/heads/main".to_string(),
+        old_sha: Some("aaaa000000000000000000000000000000000001".to_string()),
+        new_sha: "aaaa000000000000000000000000000000000002".to_string(),
+    }]).await;
 
-    let non_owner_signer = Signer::from_secret_key(non_owner_secret).unwrap();
+    // Should still have only 1 pack (empty data not stored)
+    assert_eq!(ctx.get_pack_count().await, 1);
 
-    let objects = vec![blob(b"hacker data")];
+    // Ref should be updated
+    let refs = ctx.get_refs().await;
+    assert_eq!(refs[0].1, "aaaa000000000000000000000000000000000002");
+}
+
+#[tokio::test]
+async fn test_ref_cas_failure() {
+    let ctx = setup().await;
+
+    ctx.push_pack(b"pack", &[RefUpdate {
+        name: "refs/heads/main".to_string(),
+        old_sha: None,
+        new_sha: "aaaa000000000000000000000000000000000001".to_string(),
+    }]).await;
+
+    // Wrong old_sha should fail
     let result = Contract(ctx.contract_id.clone())
-        .call_function_borsh("push_objects", &objects)
+        .call_function_borsh("push", (
+            b"pack2".to_vec(),
+            vec![RefUpdate {
+                name: "refs/heads/main".to_string(),
+                old_sha: Some("0000000000000000000000000000000000000000".to_string()),
+                new_sha: "aaaa000000000000000000000000000000000002".to_string(),
+            }],
+        ))
         .transaction()
-        .with_signer(non_owner_id, non_owner_signer)
+        .gas(near_api::NearGas::from_tgas(300))
+        .with_signer(ctx.owner_id.clone(), ctx.owner_signer.clone())
         .send_to(&ctx.network)
         .await
         .unwrap();
 
-    assert!(result.is_failure(), "Non-owner should not be able to push");
+    assert!(result.is_failure(), "Expected CAS failure");
 }
 
 #[tokio::test]
 async fn test_get_refs_empty() {
     let ctx = setup().await;
-    let refs: Vec<(String, String)> = ctx.view_no_args("get_refs").await;
+    let refs = ctx.get_refs().await;
     assert!(refs.is_empty());
 }
 
-#[tokio::test]
-async fn test_get_objects_missing() {
-    let ctx = setup().await;
-    let objects = ctx.get_objects(vec!["0000000000000000000000000000000000000000".to_string()]).await;
-    assert_eq!(objects.len(), 1);
-    assert!(objects[0].1.is_none());
-}
+/// Helper: create a git repo in a temp dir with initial content, return the path.
+fn create_test_repo(name: &str, content: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("near-git-test-{}-{}", name, std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
 
-#[tokio::test]
-async fn test_duplicate_push_is_idempotent() {
-    let ctx = setup().await;
-
-    let obj = blob(b"same data");
-    let sha = obj.sha.clone();
-
-    ctx.push_objects(vec![obj.clone()]).await;
-    ctx.push_objects(vec![obj]).await;
-
-    let objects = ctx.get_objects(vec![sha]).await;
-    assert_eq!(objects[0].1.as_ref().unwrap().data, b"same data");
-}
-
-#[tokio::test]
-async fn test_stores_compressed_data_verbatim() {
-    let ctx = setup().await;
-
-    // Simulate client sending "compressed" bytes — contract stores as-is
-    let compressed = vec![0x78, 0x9c, 0xab, 0xca]; // fake zlib header
-    let obj = GitObject {
-        sha: "deadbeef00000000000000000000000000000000".to_string(),
-        obj_type: "blob".to_string(),
-        data: compressed.clone(),
+    let run = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&dir)
+            .output()
+            .unwrap()
     };
 
-    ctx.push_objects(vec![obj]).await;
+    run(&["init"]);
+    run(&["-c", "user.name=test", "-c", "user.email=test@test", "commit", "--allow-empty", "-m", "init"]);
+    std::fs::write(dir.join("file.txt"), content).unwrap();
+    run(&["add", "."]);
+    run(&["-c", "user.name=test", "-c", "user.email=test@test", "commit", "-m", "add file"]);
 
-    let objects = ctx.get_objects(vec!["deadbeef00000000000000000000000000000000".to_string()]).await;
-    assert_eq!(objects[0].1.as_ref().unwrap().data, compressed);
+    dir
+}
+
+/// Helper: get HEAD SHA of a git repo.
+fn get_head_sha(dir: &std::path::Path) -> String {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
+/// Helper: build a packfile from a git repo using `git pack-objects`.
+fn build_pack(dir: &std::path::Path, new_sha: &str, old_sha: Option<&str>) -> Vec<u8> {
+    let mut child = std::process::Command::new("git")
+        .args(["pack-objects", "--stdout", "--delta-base-offset", "--revs", "--thin"])
+        .current_dir(dir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        writeln!(stdin, "{}", new_sha).unwrap();
+        if let Some(old) = old_sha {
+            writeln!(stdin, "--not").unwrap();
+            writeln!(stdin, "{}", old).unwrap();
+        }
+    }
+
+    child.wait_with_output().unwrap().stdout
+}
+
+#[tokio::test]
+async fn test_packfile_storage_initial_push() {
+    let ctx = setup().await;
+
+    // Create a repo with a ~8KB file
+    let content: String = (0..200)
+        .map(|i| format!("line {}: hello world content here padding\n", i))
+        .collect();
+    let dir = create_test_repo("initial", &content);
+    let head = get_head_sha(&dir);
+    let pack = build_pack(&dir, &head, None);
+
+    let initial_storage = ctx.get_storage_bytes().await;
+
+    ctx.push_pack(&pack, &[RefUpdate {
+        name: "refs/heads/main".to_string(),
+        old_sha: None,
+        new_sha: head,
+    }]).await;
+
+    let after_push = ctx.get_storage_bytes().await;
+    let storage_used = after_push - initial_storage;
+
+    eprintln!("=== Initial push ===");
+    eprintln!("Content: {} bytes, Packfile: {} bytes, Storage: {} bytes",
+        content.len(), pack.len(), storage_used);
+
+    // Packfile should be significantly smaller than raw content due to zlib
+    assert!(pack.len() < content.len(), "Pack should be smaller than raw content");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn test_packfile_storage_incremental_push() {
+    let ctx = setup().await;
+
+    // Create a repo with a ~8KB file
+    let content_v1: String = (0..200)
+        .map(|i| format!("line {}: hello world content here padding\n", i))
+        .collect();
+    let dir = create_test_repo("incremental", &content_v1);
+    let sha_v1 = get_head_sha(&dir);
+    let pack_v1 = build_pack(&dir, &sha_v1, None);
+
+    ctx.push_pack(&pack_v1, &[RefUpdate {
+        name: "refs/heads/main".to_string(),
+        old_sha: None,
+        new_sha: sha_v1.clone(),
+    }]).await;
+
+    let after_v1 = ctx.get_storage_bytes().await;
+
+    // Make a small change (add one line)
+    let mut content_v2 = content_v1.clone();
+    content_v2.insert_str(0, "// Added a single comment line\n");
+    std::fs::write(dir.join("file.txt"), &content_v2).unwrap();
+    std::process::Command::new("git")
+        .args(["add", "."])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["-c", "user.name=test", "-c", "user.email=test@test", "commit", "-m", "small edit"])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+
+    let sha_v2 = get_head_sha(&dir);
+    let pack_v2 = build_pack(&dir, &sha_v2, Some(&sha_v1));
+
+    ctx.push_pack(&pack_v2, &[RefUpdate {
+        name: "refs/heads/main".to_string(),
+        old_sha: Some(sha_v1),
+        new_sha: sha_v2,
+    }]).await;
+
+    let after_v2 = ctx.get_storage_bytes().await;
+
+    let v2_storage = after_v2 - after_v1;
+
+    eprintln!("=== Incremental push (thin pack) ===");
+    eprintln!("Content change: 1 line added to {} byte file", content_v1.len());
+    eprintln!("Full pack v1: {} bytes", pack_v1.len());
+    eprintln!("Thin pack v2: {} bytes", pack_v2.len());
+    eprintln!("Storage increase for v2: {} bytes", v2_storage);
+
+    // Thin pack for a small change should be very small (< 1KB)
+    assert!(
+        pack_v2.len() < 1000,
+        "Thin pack for 1-line change should be < 1KB, got {} bytes", pack_v2.len()
+    );
+
+    // Storage increase should be proportional to the thin pack, not the full file
+    assert!(
+        v2_storage < 2000,
+        "Storage increase for 1-line change should be < 2KB, got {} bytes", v2_storage
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
 }

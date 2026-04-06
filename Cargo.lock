@@ -1004,7 +1004,6 @@ name = "git-remote-near"
 version = "0.1.0"
 dependencies = [
  "borsh",
- "git-core",
  "near-api",
  "serde",
  "serde_json",

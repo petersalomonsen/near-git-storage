@@ -7,61 +7,29 @@ const FEE_RECIPIENT: &str = env!("FEE_RECIPIENT");
 /// Service fee charged on every new() call to cover global contract deployment costs.
 const SERVICE_FEE: NearToken = NearToken::from_millinear(100); // 0.1 NEAR
 
-/// A git object SHA-1 hash as a 40-character hex string.
-pub type SHA = String;
-
-/// A transaction hash as a base58-encoded string (NEAR's standard format).
-pub type TxHash = String;
-
-/// A git object sent to the contract (borsh-serialized).
-/// The client computes the SHA and handles all compression/delta logic.
-/// The contract is a trusted key-value store (owner-only writes).
-#[near(serializers = [borsh])]
-#[derive(Clone)]
-pub struct GitObject {
-    /// Client-computed git SHA-1 hash for this object.
-    pub sha: SHA,
-    /// Object type: "blob", "tree", "commit", or "tag"
-    pub obj_type: String,
-    /// Object data bytes — may be compressed/delta'd by the client.
-    /// The contract stores these verbatim and returns them as-is.
-    pub data: Vec<u8>,
-}
-
 /// A ref update with compare-and-swap semantics.
-#[near(serializers = [json])]
+#[near(serializers = [borsh, json])]
 #[derive(Clone)]
 pub struct RefUpdate {
     /// Ref name, e.g. "refs/heads/main"
     pub name: String,
     /// Expected current SHA (None if creating a new ref)
-    pub old_sha: Option<SHA>,
+    pub old_sha: Option<String>,
     /// New SHA to set
-    pub new_sha: SHA,
-}
-
-/// A retrieved git object (borsh-serialized in get_objects response).
-#[near(serializers = [borsh])]
-pub struct RetrievedObject {
-    pub obj_type: String,
-    /// Stored data bytes (verbatim — client handles decompression)
-    pub data: Vec<u8>,
+    pub new_sha: String,
 }
 
 #[near(contract_state)]
 #[derive(PanicOnDefault)]
 pub struct GitStorage {
     /// Branch/tag pointers: refname -> SHA
-    refs: IterableMap<String, SHA>,
+    refs: IterableMap<String, String>,
 
-    /// Object locations: SHA -> transaction hash where the data was posted
-    object_txs: IterableMap<SHA, TxHash>,
+    /// Stored packfiles, one per push. Index 0, 1, 2, ...
+    packs: LookupMap<u32, Vec<u8>>,
 
-    /// Object types: SHA -> obj_type ("blob", "tree", "commit", "tag")
-    object_types: LookupMap<SHA, String>,
-
-    /// Object data: SHA -> opaque bytes (client-managed compression)
-    object_data: LookupMap<SHA, Vec<u8>>,
+    /// Number of stored packfiles.
+    pack_count: u32,
 
     /// Repo owner (only owner can push)
     owner: AccountId,
@@ -76,10 +44,9 @@ impl GitStorage {
         Promise::new(fee_recipient).transfer(SERVICE_FEE);
 
         Self {
-            refs: IterableMap::new(b"r"),
-            object_txs: IterableMap::new(b"o"),
-            object_types: LookupMap::new(b"t"),
-            object_data: LookupMap::new(b"d"),
+            refs: IterableMap::new(b"R"),
+            packs: LookupMap::new(b"P"),
+            pack_count: 0,
             owner: env::signer_account_id(),
         }
     }
@@ -93,41 +60,20 @@ impl GitStorage {
         );
     }
 
-    /// Store git objects (borsh-serialized input/output).
-    /// The client provides the SHA and compressed data.
-    /// The contract stores them verbatim — no computation.
-    #[result_serializer(borsh)]
-    pub fn push_objects(
+    /// Store a packfile and update refs.
+    /// The packfile is stored verbatim — client handles delta compression.
+    /// Args are borsh-serialized as sequential fields: pack_data then ref_updates.
+    pub fn push(
         &mut self,
-        #[serializer(borsh)] objects: Vec<GitObject>,
+        #[serializer(borsh)] pack_data: Vec<u8>,
+        #[serializer(borsh)] ref_updates: Vec<RefUpdate>,
     ) {
         self.assert_owner();
 
-        for obj in &objects {
-            // Only store if not already present (objects are immutable)
-            if self.object_types.get(&obj.sha).is_none() {
-                self.object_types.insert(obj.sha.clone(), obj.obj_type.clone());
-                self.object_data.insert(obj.sha.clone(), obj.data.clone());
-            }
-        }
-    }
-
-    /// Register a previous push_objects transaction and update refs.
-    /// Called after push_objects, with the tx_hash from that transaction.
-    ///
-    /// - Stores SHA -> tx_hash mappings for each object
-    /// - Updates refs with compare-and-swap semantics
-    pub fn register_push(
-        &mut self,
-        tx_hash: TxHash,
-        object_shas: Vec<SHA>,
-        ref_updates: Vec<RefUpdate>,
-    ) {
-        self.assert_owner();
-
-        // Store SHA -> tx_hash mappings
-        for sha in &object_shas {
-            self.object_txs.insert(sha.clone(), tx_hash.clone());
+        // Store packfile
+        if !pack_data.is_empty() {
+            self.packs.insert(self.pack_count, pack_data);
+            self.pack_count += 1;
         }
 
         // Update refs with compare-and-swap
@@ -135,15 +81,12 @@ impl GitStorage {
             let current = self.refs.get(&update.name).cloned();
 
             match (&update.old_sha, &current) {
-                // Creating a new ref: old_sha is None, current must also be None
                 (None, None) => {
                     self.refs.insert(update.name.clone(), update.new_sha.clone());
                 }
-                // Updating an existing ref: old_sha must match current
                 (Some(old), Some(cur)) if old == cur => {
                     self.refs.insert(update.name.clone(), update.new_sha.clone());
                 }
-                // Mismatch: CAS failure
                 (old_sha, current) => {
                     env::panic_str(&format!(
                         "Ref update CAS failure for '{}': expected {:?}, got {:?}",
@@ -154,49 +97,26 @@ impl GitStorage {
         }
     }
 
-    /// Return all refs (view call, free).
-    pub fn get_refs(&self) -> Vec<(String, SHA)> {
+    /// Return all refs (view call).
+    pub fn get_refs(&self) -> Vec<(String, String)> {
         self.refs.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
     }
 
-    /// Return transaction locations for requested objects (view call, free).
-    pub fn get_object_locations(&self, shas: Vec<SHA>) -> Vec<(SHA, Option<TxHash>)> {
-        shas.into_iter()
-            .map(|sha| {
-                let tx = self.object_txs.get(&sha).cloned();
-                (sha, tx)
-            })
-            .collect()
+    /// Return the number of stored packfiles.
+    pub fn get_pack_count(&self) -> u32 {
+        self.pack_count
     }
 
-    /// Retrieve stored objects by SHA (borsh-serialized input/output, view call).
-    /// Returns data verbatim — client handles decompression.
+    /// Retrieve packfiles starting from `from_index` (borsh input/output, view call).
+    /// For full clone: from_index=0. For incremental pull: from_index=last_seen+1.
     #[result_serializer(borsh)]
-    pub fn get_objects(
+    pub fn get_packs(
         &self,
-        #[serializer(borsh)] shas: Vec<SHA>,
-    ) -> Vec<(SHA, Option<RetrievedObject>)> {
-        shas.into_iter()
-            .map(|sha| {
-                let obj = self
-                    .object_types
-                    .get(&sha)
-                    .and_then(|obj_type| {
-                        self.object_data.get(&sha).map(|data| RetrievedObject {
-                            obj_type: obj_type.clone(),
-                            data: data.clone(),
-                        })
-                    });
-                (sha, obj)
-            })
+        #[serializer(borsh)] from_index: u32,
+    ) -> Vec<Vec<u8>> {
+        (from_index..self.pack_count)
+            .filter_map(|i| self.packs.get(&i).cloned())
             .collect()
-    }
-
-    /// Return all stored object SHAs (view call).
-    /// Clients use this to determine which objects they're missing,
-    /// then fetch only those via get_objects.
-    pub fn get_all_shas(&self) -> Vec<SHA> {
-        self.object_txs.keys().cloned().collect()
     }
 
     /// Return the contract owner.
