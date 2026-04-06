@@ -20,19 +20,12 @@ use serde::Deserialize;
 use serde_json::json;
 use tracing::{error, info};
 
-/// Borsh-serialized git object for push_objects calls.
-#[derive(BorshSerialize)]
-struct GitObject {
-    sha: String,
-    obj_type: String,
-    data: Vec<u8>,
-}
-
-/// Borsh-deserialized object from get_objects.
-#[derive(BorshDeserialize)]
-struct RetrievedObject {
-    obj_type: String,
-    data: Vec<u8>,
+/// Borsh-serialized ref update for push calls.
+#[derive(BorshSerialize, Clone)]
+struct RefUpdate {
+    name: String,
+    old_sha: Option<String>,
+    new_sha: String,
 }
 
 /// Shared application state.
@@ -275,6 +268,15 @@ async fn handle_info_refs(
     (StatusCode::OK, headers, body).into_response()
 }
 
+/// Manually borsh-serialize push args (pack_data + ref_updates).
+fn encode_push_args(pack_data: &[u8], ref_updates: &[RefUpdate]) -> Vec<u8> {
+    use borsh::BorshSerialize;
+    let mut buf = Vec::new();
+    pack_data.to_vec().serialize(&mut buf).unwrap();
+    ref_updates.to_vec().serialize(&mut buf).unwrap();
+    buf
+}
+
 /// POST /<repo>/git-receive-pack (push)
 async fn handle_receive_pack(
     State(state): State<Arc<AppState>>,
@@ -283,225 +285,59 @@ async fn handle_receive_pack(
     info!("git-receive-pack: {} bytes", body.len());
 
     // Parse the request: ref update commands followed by packfile
-    let (commands, rest) = pktline::read_until_flush(&body);
+    let (commands, pack_data) = pktline::read_until_flush(&body);
 
     // Parse ref update commands
     let mut ref_updates = Vec::new();
+    let mut ref_names = Vec::new();
     for cmd in &commands {
         let line = String::from_utf8_lossy(cmd);
-        // Strip trailing newline and capabilities
         let line = line.trim_end_matches('\n');
         let parts: Vec<&str> = line.splitn(3, ' ').collect();
         if parts.len() >= 3 {
             let old_sha = parts[0].split('\0').next().unwrap_or(parts[0]);
             let new_sha = parts[1];
-            // ref name may have \0capabilities appended
             let ref_name = parts[2].split('\0').next().unwrap_or(parts[2]);
 
-            let old = if old_sha == ZERO_SHA {
-                None
-            } else {
-                Some(old_sha.to_string())
-            };
-
-            ref_updates.push(json!({
-                "name": ref_name,
-                "old_sha": old,
-                "new_sha": new_sha,
-            }));
+            ref_updates.push(RefUpdate {
+                name: ref_name.to_string(),
+                old_sha: if old_sha == ZERO_SHA { None } else { Some(old_sha.to_string()) },
+                new_sha: new_sha.to_string(),
+            });
+            ref_names.push(ref_name.to_string());
 
             info!("  ref update: {} {} -> {}", ref_name, old_sha, new_sha);
         }
     }
 
-    // Check if this is a delete-only push (new_sha is all zeros)
-    let is_delete_only = ref_updates.iter().all(|u| {
-        u["new_sha"].as_str() == Some(ZERO_SHA)
-    });
+    // Store the packfile and update refs in one call
+    let push_result = Contract(state.contract_id.clone())
+        .call_function_raw("push", encode_push_args(pack_data, &ref_updates))
+        .transaction()
+        .gas(near_api::NearGas::from_tgas(300))
+        .with_signer(state.owner_id.clone(), state.owner_signer.clone())
+        .send_to(&state.network)
+        .await;
 
-    let mut object_shas = Vec::new();
-
-    if !is_delete_only && !rest.is_empty() {
-        // Parse packfile
-        let parse_result = match packfile::parse(rest) {
-            Ok(r) => r,
-            Err(e) => {
-                error!("Failed to parse packfile: {}", e);
-                return make_receive_pack_response(&[format!("ng unpack {}", e)]);
+    match push_result {
+        Ok(r) if r.is_success() => {
+            info!("  push succeeded ({} bytes packfile)", pack_data.len());
+            let mut status_lines = vec!["unpack ok".to_string()];
+            for name in &ref_names {
+                status_lines.push(format!("ok {}", name));
             }
-        };
-
-        let mut pack_objects = parse_result.objects;
-
-        // Resolve ref_delta objects by fetching base objects from contract
-        if !parse_result.deltas.is_empty() {
-            info!(
-                "  resolving {} ref_delta objects",
-                parse_result.deltas.len()
-            );
-
-            // Build a map of objects we already have (from this pack)
-            let mut local_objects: std::collections::HashMap<String, (String, Vec<u8>)> =
-                std::collections::HashMap::new();
-            for obj in &pack_objects {
-                local_objects.insert(obj.sha1(), (obj.obj_type.clone(), obj.data.clone()));
-            }
-
-            for delta in &parse_result.deltas {
-                // Try local first, then fetch from contract
-                let base = if let Some((obj_type, data)) = local_objects.get(&delta.base_sha) {
-                    Some((obj_type.clone(), data.clone()))
-                } else {
-                    // Fetch from contract (borsh)
-                    let shas_query = vec![delta.base_sha.clone()];
-                    let result: Vec<(String, Option<RetrievedObject>)> =
-                        Contract(state.contract_id.clone())
-                            .call_function_borsh("get_objects", &shas_query)
-                            .read_only_borsh()
-                            .fetch_from(&state.network)
-                            .await
-                            .unwrap()
-                            .data;
-
-                    result.into_iter().next().and_then(|(_, v)| {
-                        v.map(|obj| (obj.obj_type, packfile::zlib_decompress(&obj.data)))
-                    })
-                };
-
-                match base {
-                    Some((obj_type, base_data)) => {
-                        match packfile::apply_delta(&base_data, &delta.delta_data) {
-                            Ok(resolved_data) => {
-                                pack_objects.push(packfile::PackObject {
-                                    obj_type,
-                                    data: resolved_data,
-                                });
-                            }
-                            Err(e) => {
-                                error!("Failed to apply delta: {}", e);
-                                return make_receive_pack_response(&[format!(
-                                    "ng unpack delta apply failed: {}",
-                                    e
-                                )]);
-                            }
-                        }
-                    }
-                    None => {
-                        error!(
-                            "Base object {} not found for delta",
-                            delta.base_sha
-                        );
-                        return make_receive_pack_response(&[format!(
-                            "ng unpack base object {} not found",
-                            delta.base_sha
-                        )]);
-                    }
-                }
-            }
+            make_receive_pack_response(&status_lines)
         }
-
-        info!("  parsed {} objects from packfile", pack_objects.len());
-
-        // Convert to contract format and push (borsh-serialized)
-        let git_objects: Vec<GitObject> = pack_objects
-            .iter()
-            .map(|obj| GitObject {
-                sha: obj.sha1(),
-                obj_type: obj.obj_type.clone(),
-                data: packfile::zlib_compress(&obj.data),
-            })
-            .collect();
-
-        // Call push_objects on the contract
-        let push_result = Contract(state.contract_id.clone())
-            .call_function_borsh("push_objects", &git_objects)
-            .transaction()
-            .with_signer(state.owner_id.clone(), state.owner_signer.clone())
-            .send_to(&state.network)
-            .await;
-
-        let push_result = match push_result {
-            Ok(r) => r,
-            Err(e) => {
-                error!("push_objects RPC failed: {}", e);
-                return make_receive_pack_response(&["ng unpack contract call failed".into()]);
-            }
-        };
-
-        let full = match push_result.into_full() {
-            Some(f) => f,
-            None => {
-                return make_receive_pack_response(&["ng unpack transaction pending".into()]);
-            }
-        };
-
-        let tx_hash = full.outcome().transaction_hash.to_string();
-
-        object_shas = git_objects.iter().map(|o| o.sha.clone()).collect();
-
-        info!("  pushed {} objects, tx={}", object_shas.len(), tx_hash);
-
-        // Register push with ref updates
-        let register_result = Contract(state.contract_id.clone())
-            .call_function(
-                "register_push",
-                json!({
-                    "tx_hash": tx_hash,
-                    "object_shas": object_shas,
-                    "ref_updates": ref_updates,
-                }),
-            )
-            .transaction()
-            .with_signer(state.owner_id.clone(), state.owner_signer.clone())
-            .send_to(&state.network)
-            .await;
-
-        match register_result {
-            Ok(r) if r.is_success() => {
-                info!("  refs updated successfully");
-            }
-            Ok(r) => {
-                let err = format!("{:?}", r.assert_failure());
-                error!("register_push failed: {}", err);
-                return make_receive_pack_response(&[format!("ng refs {}", err)]);
-            }
-            Err(e) => {
-                error!("register_push RPC failed: {}", e);
-                return make_receive_pack_response(&["ng refs contract call failed".into()]);
-            }
+        Ok(r) => {
+            let err = format!("{:?}", r.assert_failure());
+            error!("push failed: {}", err);
+            make_receive_pack_response(&[format!("ng unpack {}", err)])
         }
-    } else if !is_delete_only {
-        // No packfile but not a delete — just update refs
-        let register_result = Contract(state.contract_id.clone())
-            .call_function(
-                "register_push",
-                json!({
-                    "tx_hash": "none",
-                    "object_shas": [],
-                    "ref_updates": ref_updates,
-                }),
-            )
-            .transaction()
-            .with_signer(state.owner_id.clone(), state.owner_signer.clone())
-            .send_to(&state.network)
-            .await;
-
-        match register_result {
-            Ok(r) if r.is_success() => {}
-            _ => {
-                return make_receive_pack_response(&["ng refs update failed".into()]);
-            }
+        Err(e) => {
+            error!("push RPC failed: {}", e);
+            make_receive_pack_response(&["ng unpack contract call failed".into()])
         }
     }
-
-    // Build success response with per-ref status
-    let mut status_lines = vec!["unpack ok".to_string()];
-    for update in &ref_updates {
-        if let Some(ref_name) = update["name"].as_str() {
-            status_lines.push(format!("ok {}", ref_name));
-        }
-    }
-    make_receive_pack_response(&status_lines)
 }
 
 /// Build a receive-pack response with report-status lines.
@@ -587,58 +423,47 @@ async fn handle_upload_pack(
         return (StatusCode::OK, headers, body).into_response();
     }
 
-    // Get all SHAs from contract, filter out haves
-    let all_shas: Vec<String> = Contract(state.contract_id.clone())
-        .call_function("get_all_shas", json!({}))
-        .read_only()
+    // Get all packfiles from contract and concatenate them into a response
+    let packs: Vec<Vec<u8>> = Contract(state.contract_id.clone())
+        .call_function_borsh("get_packs", &0u32)
+        .read_only_borsh()
         .fetch_from(&state.network)
         .await
         .unwrap()
         .data;
 
-    let haves_set: std::collections::HashSet<String> = haves.into_iter().collect();
-    let needed: Vec<String> = all_shas
-        .into_iter()
-        .filter(|sha| !haves_set.contains(sha))
-        .collect();
+    info!("  {} packs from contract", packs.len());
 
-    info!("  need {} objects", needed.len());
-
-    // Fetch needed objects in batches, decompress each
-    let mut pack_objects = Vec::new();
-
-    for chunk in needed.chunks(50) {
-        let shas_query: Vec<String> = chunk.to_vec();
-        let objects: Vec<(String, Option<RetrievedObject>)> =
-            Contract(state.contract_id.clone())
-                .call_function_borsh("get_objects", &shas_query)
-                .read_only_borsh()
-                .fetch_from(&state.network)
-                .await
-                .unwrap()
-                .data;
-
-        for (_sha, maybe_obj) in objects {
-            if let Some(obj) = maybe_obj {
-                pack_objects.push(packfile::PackObject {
-                    obj_type: obj.obj_type,
-                    data: packfile::zlib_decompress(&obj.data),
-                });
+    // Merge all packs into one by parsing objects and rebuilding
+    let mut all_objects = Vec::new();
+    for pack in &packs {
+        if let Ok(result) = packfile::parse(pack) {
+            for obj in result.objects {
+                all_objects.push(obj);
+            }
+            // Resolve deltas using objects from the same pack
+            let mut local: std::collections::HashMap<String, (String, Vec<u8>)> =
+                std::collections::HashMap::new();
+            for obj in &all_objects {
+                local.insert(obj.sha1(), (obj.obj_type.clone(), obj.data.clone()));
+            }
+            for delta in &result.deltas {
+                if let Some((obj_type, base_data)) = local.get(&delta.base_sha) {
+                    if let Ok(resolved) = packfile::apply_delta(base_data, &delta.delta_data) {
+                        let obj = packfile::PackObject { obj_type: obj_type.clone(), data: resolved };
+                        local.insert(obj.sha1(), (obj.obj_type.clone(), obj.data.clone()));
+                        all_objects.push(obj);
+                    }
+                }
             }
         }
     }
 
-    // Build packfile
-    let pack_data = packfile::build(&pack_objects);
-    info!("  built packfile: {} bytes, {} objects", pack_data.len(), pack_objects.len());
+    let pack_data = packfile::build(&all_objects);
+    info!("  built packfile: {} bytes, {} objects", pack_data.len(), all_objects.len());
 
-    // Build response
     let mut response_body = Vec::new();
     response_body.extend_from_slice(&pktline::encode(b"NAK\n"));
-
-    // Send packfile data using side-band-64k (channel 1 = pack data)
-    // Actually, for simplicity, just send the packfile directly without sideband
-    // The NAK followed by raw packfile data is the simplest protocol variant
     response_body.extend_from_slice(&pack_data);
 
     let mut headers = HeaderMap::new();
@@ -679,8 +504,8 @@ async fn handle_near_credentials(State(state): State<Arc<AppState>>) -> Response
 
 /// POST /near-call — proxy signed contract function calls from the service worker.
 ///
-/// For push_objects: accepts JSON with base64-encoded data from the service worker,
-/// converts to borsh for the contract, then returns borsh result as JSON.
+/// For push: accepts JSON with base64-encoded pack_data + ref_updates,
+/// converts to borsh for the contract.
 /// For other methods: passes JSON through directly.
 async fn handle_near_call(
     State(state): State<Arc<AppState>>,
@@ -698,30 +523,30 @@ async fn handle_near_call(
 
     info!("near-call: method={}", method);
 
-    if method == "push_objects" {
-        // Convert JSON objects to borsh GitObjects
-        let objects_json = args["objects"].as_array();
-        let git_objects: Vec<GitObject> = objects_json
+    if method == "push" {
+        // Decode pack_data from base64
+        let pack_b64 = args["pack_data"].as_str().unwrap_or("");
+        let pack_data = base64::engine::general_purpose::STANDARD
+            .decode(pack_b64)
+            .unwrap_or_default();
+
+        let ref_updates: Vec<RefUpdate> = args["ref_updates"]
+            .as_array()
             .map(|arr| {
                 arr.iter()
-                    .map(|obj| {
-                        let data_b64 = obj["data"].as_str().unwrap_or("");
-                        let data = base64::engine::general_purpose::STANDARD
-                            .decode(data_b64)
-                            .unwrap_or_default();
-                        GitObject {
-                            sha: obj["sha"].as_str().unwrap_or("").to_string(),
-                            obj_type: obj["obj_type"].as_str().unwrap_or("blob").to_string(),
-                            data,
-                        }
+                    .map(|u| RefUpdate {
+                        name: u["name"].as_str().unwrap_or("").to_string(),
+                        old_sha: u["old_sha"].as_str().map(String::from),
+                        new_sha: u["new_sha"].as_str().unwrap_or("").to_string(),
                     })
                     .collect()
             })
             .unwrap_or_default();
 
         let result = Contract(state.contract_id.clone())
-            .call_function_borsh("push_objects", &git_objects)
+            .call_function_raw("push", encode_push_args(&pack_data, &ref_updates))
             .transaction()
+            .gas(near_api::NearGas::from_tgas(300))
             .with_signer(state.owner_id.clone(), state.owner_signer.clone())
             .send_to(&state.network)
             .await;
@@ -730,25 +555,12 @@ async fn handle_near_call(
             Ok(r) => {
                 let tx_hash = r.transaction().get_hash().to_string();
                 if r.is_success() {
-                    let shas: Vec<String> = git_objects.iter().map(|o| o.sha.clone()).collect();
-                    axum::Json(json!({
-                        "success": true,
-                        "result": { "shas": shas },
-                        "txHash": tx_hash,
-                    }))
-                    .into_response()
+                    axum::Json(json!({ "success": true, "txHash": tx_hash })).into_response()
                 } else {
-                    axum::Json(json!({
-                        "success": false,
-                        "error": "transaction failed",
-                        "txHash": tx_hash,
-                    }))
-                    .into_response()
+                    axum::Json(json!({ "success": false, "error": "push failed", "txHash": tx_hash })).into_response()
                 }
             }
-            Err(e) => {
-                axum::Json(json!({ "success": false, "error": e.to_string() })).into_response()
-            }
+            Err(e) => axum::Json(json!({ "success": false, "error": e.to_string() })).into_response(),
         }
     } else {
         // Other methods: pass JSON through directly
@@ -765,24 +577,12 @@ async fn handle_near_call(
                 if r.is_success() {
                     let full = r.into_full().unwrap();
                     let data: serde_json::Value = full.json().unwrap_or(json!(null));
-                    axum::Json(json!({
-                        "success": true,
-                        "result": data,
-                        "txHash": tx_hash,
-                    }))
-                    .into_response()
+                    axum::Json(json!({ "success": true, "result": data, "txHash": tx_hash })).into_response()
                 } else {
-                    axum::Json(json!({
-                        "success": false,
-                        "error": "transaction failed",
-                        "txHash": tx_hash,
-                    }))
-                    .into_response()
+                    axum::Json(json!({ "success": false, "error": "transaction failed", "txHash": tx_hash })).into_response()
                 }
             }
-            Err(e) => {
-                axum::Json(json!({ "success": false, "error": e.to_string() })).into_response()
-            }
+            Err(e) => axum::Json(json!({ "success": false, "error": e.to_string() })).into_response(),
         }
     }
 }
