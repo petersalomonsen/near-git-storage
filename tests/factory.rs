@@ -168,21 +168,33 @@ async fn test_factory_create_repo() {
 
     assert_eq!(owner, owner_id.to_string());
 
-    // Verify the repo is functional — push objects as the owner (borsh-serialized)
-    #[derive(borsh::BorshSerialize)]
-    struct GitObject {
-        sha: String,
-        obj_type: String,
-        data: Vec<u8>,
+    // Verify the repo is functional — push a packfile as the owner
+    #[derive(borsh::BorshSerialize, Clone)]
+    struct RefUpdate {
+        name: String,
+        old_sha: Option<String>,
+        new_sha: String,
     }
-    let objects = vec![GitObject {
-        sha: "deadbeef00000000000000000000000000000000".to_string(),
-        obj_type: "blob".to_string(),
-        data: b"hello from factory repo".to_vec(),
+
+    fn encode_push_args(pack_data: &[u8], ref_updates: &[RefUpdate]) -> Vec<u8> {
+        use borsh::BorshSerialize;
+        let mut buf = Vec::new();
+        pack_data.to_vec().serialize(&mut buf).unwrap();
+        ref_updates.to_vec().serialize(&mut buf).unwrap();
+        buf
+    }
+
+    let pack_data = b"PACK\x00\x00\x00\x02\x00\x00\x00\x00test-pack";
+    let ref_updates = vec![RefUpdate {
+        name: "refs/heads/main".to_string(),
+        old_sha: None,
+        new_sha: "deadbeef00000000000000000000000000000000".to_string(),
     }];
+
     let result = Contract(repo_id.clone())
-        .call_function_borsh("push_objects", &objects)
+        .call_function_raw("push", encode_push_args(pack_data, &ref_updates))
         .transaction()
+        .gas(near_api::NearGas::from_tgas(300))
         .with_signer(owner_id, owner_signer)
         .send_to(&s.network)
         .await
