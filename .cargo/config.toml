@@ -1,0 +1,5 @@
+[env]
+# Default fee recipient for sandbox/test builds (sandbox genesis account always exists).
+# Override for testnet: FEE_RECIPIENT=gitfactory.testnet ./build.sh
+# Override for mainnet: FEE_RECIPIENT=gitfactory.near ./build.sh
+FEE_RECIPIENT = { value = "sandbox", force = false }

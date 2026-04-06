@@ -13,11 +13,27 @@ use axum::{
 };
 use tower_http::cors::{Any, CorsLayer};
 use base64::Engine;
+use borsh::{BorshDeserialize, BorshSerialize};
 use near_api::{AccountId, Contract, Signer};
 use near_sandbox::Sandbox;
 use serde::Deserialize;
 use serde_json::json;
 use tracing::{error, info};
+
+/// Borsh-serialized git object for push_objects calls.
+#[derive(BorshSerialize)]
+struct GitObject {
+    sha: String,
+    obj_type: String,
+    data: Vec<u8>,
+}
+
+/// Borsh-deserialized object from get_objects.
+#[derive(BorshDeserialize)]
+struct RetrievedObject {
+    obj_type: String,
+    data: Vec<u8>,
+}
 
 /// Shared application state.
 struct AppState {
@@ -94,15 +110,22 @@ async fn main() {
     let storage_wasm = std::fs::read("res/near_git_storage.wasm")
         .expect("Contract WASM not found. Run `./build.sh` first.");
 
+    // Compute SHA-256 hash for hash-based global contract
+    use sha2::{Digest, Sha256};
+    let wasm_hash: String = Sha256::digest(&storage_wasm)
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect();
+
     Contract::deploy_global_contract_code(storage_wasm)
-        .as_account_id(global_id.clone())
-        .with_signer(Signer::from_secret_key(global_secret).unwrap())
+        .as_hash()
+        .with_signer(global_id.clone(), Signer::from_secret_key(global_secret).unwrap())
         .send_to(&network)
         .await
         .unwrap()
         .assert_success();
 
-    info!("Global contract deployed at {}", global_id);
+    info!("Global contract deployed at {} (hash: {})", global_id, wasm_hash);
 
     // Deploy factory contract
     let factory_secret = near_api::signer::generate_secret_key().unwrap();
@@ -122,7 +145,7 @@ async fn main() {
 
     Contract::deploy(factory_id.clone())
         .use_code(factory_wasm)
-        .with_init_call("new", json!({ "global_contract": global_id.to_string() }))
+        .with_init_call("new", json!({ "global_contract_hash": wasm_hash }))
         .unwrap()
         .with_signer(Signer::from_secret_key(factory_secret).unwrap())
         .send_to(&network)
@@ -329,29 +352,19 @@ async fn handle_receive_pack(
                 let base = if let Some((obj_type, data)) = local_objects.get(&delta.base_sha) {
                     Some((obj_type.clone(), data.clone()))
                 } else {
-                    // Fetch from contract
-                    let result: Vec<(String, Option<serde_json::Value>)> =
+                    // Fetch from contract (borsh)
+                    let shas_query = vec![delta.base_sha.clone()];
+                    let result: Vec<(String, Option<RetrievedObject>)> =
                         Contract(state.contract_id.clone())
-                            .call_function(
-                                "get_objects",
-                                json!({ "shas": [&delta.base_sha] }),
-                            )
-                            .read_only()
+                            .call_function_borsh("get_objects", &shas_query)
+                            .read_only_borsh()
                             .fetch_from(&state.network)
                             .await
                             .unwrap()
                             .data;
 
                     result.into_iter().next().and_then(|(_, v)| {
-                        v.map(|obj| {
-                            let obj_type =
-                                obj["obj_type"].as_str().unwrap_or("blob").to_string();
-                            let data_b64 = obj["data"].as_str().unwrap_or("");
-                            let data = base64::engine::general_purpose::STANDARD
-                                .decode(data_b64)
-                                .unwrap_or_default();
-                            (obj_type, data)
-                        })
+                        v.map(|obj| (obj.obj_type, packfile::zlib_decompress(&obj.data)))
                     })
                 };
 
@@ -389,20 +402,19 @@ async fn handle_receive_pack(
 
         info!("  parsed {} objects from packfile", pack_objects.len());
 
-        // Convert to contract format and push
-        let git_objects: Vec<serde_json::Value> = pack_objects
+        // Convert to contract format and push (borsh-serialized)
+        let git_objects: Vec<GitObject> = pack_objects
             .iter()
-            .map(|obj| {
-                json!({
-                    "obj_type": obj.obj_type,
-                    "data": base64::engine::general_purpose::STANDARD.encode(&obj.data),
-                })
+            .map(|obj| GitObject {
+                sha: obj.sha1(),
+                obj_type: obj.obj_type.clone(),
+                data: packfile::zlib_compress(&obj.data),
             })
             .collect();
 
         // Call push_objects on the contract
         let push_result = Contract(state.contract_id.clone())
-            .call_function("push_objects", json!({ "objects": git_objects }))
+            .call_function_borsh("push_objects", &git_objects)
             .transaction()
             .with_signer(state.owner_id.clone(), state.owner_signer.clone())
             .send_to(&state.network)
@@ -425,20 +437,7 @@ async fn handle_receive_pack(
 
         let tx_hash = full.outcome().transaction_hash.to_string();
 
-        let push_data: serde_json::Value = match full.json() {
-            Ok(v) => v,
-            Err(e) => {
-                error!("push_objects failed: {}", e);
-                return make_receive_pack_response(&[format!("ng unpack {}", e)]);
-            }
-        };
-
-        object_shas = push_data["shas"]
-            .as_array()
-            .unwrap_or(&Vec::new())
-            .iter()
-            .filter_map(|v| v.as_str().map(String::from))
-            .collect();
+        object_shas = git_objects.iter().map(|o| o.sha.clone()).collect();
 
         info!("  pushed {} objects, tx={}", object_shas.len(), tx_hash);
 
@@ -588,94 +587,32 @@ async fn handle_upload_pack(
         return (StatusCode::OK, headers, body).into_response();
     }
 
-    // Walk the object graph from wants, stopping at haves
+    // Get all SHAs from contract, filter out haves
+    let all_shas: Vec<String> = Contract(state.contract_id.clone())
+        .call_function("get_all_shas", json!({}))
+        .read_only()
+        .fetch_from(&state.network)
+        .await
+        .unwrap()
+        .data;
+
     let haves_set: std::collections::HashSet<String> = haves.into_iter().collect();
-    let mut needed: Vec<String> = Vec::new();
-    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut queue: std::collections::VecDeque<String> = wants.into_iter().collect();
+    let needed: Vec<String> = all_shas
+        .into_iter()
+        .filter(|sha| !haves_set.contains(sha))
+        .collect();
 
-    while let Some(sha) = queue.pop_front() {
-        if visited.contains(&sha) || haves_set.contains(&sha) {
-            continue;
-        }
-        visited.insert(sha.clone());
-        needed.push(sha.clone());
+    info!("  need {} objects", needed.len());
 
-        // Fetch this object to find children
-        let objects: Vec<(String, Option<serde_json::Value>)> =
-            Contract(state.contract_id.clone())
-                .call_function("get_objects", json!({ "shas": [&sha] }))
-                .read_only()
-                .fetch_from(&state.network)
-                .await
-                .unwrap()
-                .data;
-
-        for (_sha, maybe_obj) in objects {
-            if let Some(obj) = maybe_obj {
-                let obj_type = obj["obj_type"].as_str().unwrap_or("");
-                let data_b64 = obj["data"].as_str().unwrap_or("");
-                let data = base64::engine::general_purpose::STANDARD
-                    .decode(data_b64)
-                    .unwrap_or_default();
-
-                // Parse children depending on type
-                match obj_type {
-                    "commit" => {
-                        // Parse commit to find tree and parent SHAs
-                        let text = String::from_utf8_lossy(&data);
-                        for line in text.lines() {
-                            if let Some(tree_sha) = line.strip_prefix("tree ") {
-                                queue.push_back(tree_sha.trim().to_string());
-                            } else if let Some(parent_sha) = line.strip_prefix("parent ") {
-                                queue.push_back(parent_sha.trim().to_string());
-                            } else if line.is_empty() {
-                                break; // End of headers
-                            }
-                        }
-                    }
-                    "tree" => {
-                        // Parse tree entries: <mode> <name>\0<20-byte-sha>
-                        let mut pos = 0;
-                        while pos < data.len() {
-                            // Find the null byte
-                            let null_pos = data[pos..]
-                                .iter()
-                                .position(|&b| b == 0)
-                                .map(|p| pos + p);
-                            if let Some(null_pos) = null_pos {
-                                if null_pos + 21 <= data.len() {
-                                    let child_sha_bytes = &data[null_pos + 1..null_pos + 21];
-                                    let child_sha: String = child_sha_bytes
-                                        .iter()
-                                        .map(|b| format!("{:02x}", b))
-                                        .collect();
-                                    queue.push_back(child_sha);
-                                    pos = null_pos + 21;
-                                } else {
-                                    break;
-                                }
-                            } else {
-                                break;
-                            }
-                        }
-                    }
-                    _ => {} // blob, tag — no children to walk
-                }
-            }
-        }
-    }
-
-    info!("  need {} objects total", needed.len());
-
-    // Fetch all needed objects in batches
+    // Fetch needed objects in batches, decompress each
     let mut pack_objects = Vec::new();
 
     for chunk in needed.chunks(50) {
-        let objects: Vec<(String, Option<serde_json::Value>)> =
+        let shas_query: Vec<String> = chunk.to_vec();
+        let objects: Vec<(String, Option<RetrievedObject>)> =
             Contract(state.contract_id.clone())
-                .call_function("get_objects", json!({ "shas": chunk }))
-                .read_only()
+                .call_function_borsh("get_objects", &shas_query)
+                .read_only_borsh()
                 .fetch_from(&state.network)
                 .await
                 .unwrap()
@@ -683,13 +620,10 @@ async fn handle_upload_pack(
 
         for (_sha, maybe_obj) in objects {
             if let Some(obj) = maybe_obj {
-                let obj_type = obj["obj_type"].as_str().unwrap_or("blob").to_string();
-                let data_b64 = obj["data"].as_str().unwrap_or("");
-                let data = base64::engine::general_purpose::STANDARD
-                    .decode(data_b64)
-                    .unwrap_or_default();
-
-                pack_objects.push(packfile::PackObject { obj_type, data });
+                pack_objects.push(packfile::PackObject {
+                    obj_type: obj.obj_type,
+                    data: packfile::zlib_decompress(&obj.data),
+                });
             }
         }
     }
@@ -743,7 +677,11 @@ async fn handle_near_credentials(State(state): State<Arc<AppState>>) -> Response
     .into_response()
 }
 
-/// POST /near-call — proxy signed contract function calls from the service worker
+/// POST /near-call — proxy signed contract function calls from the service worker.
+///
+/// For push_objects: accepts JSON with base64-encoded data from the service worker,
+/// converts to borsh for the contract, then returns borsh result as JSON.
+/// For other methods: passes JSON through directly.
 async fn handle_near_call(
     State(state): State<Arc<AppState>>,
     body: Bytes,
@@ -760,36 +698,91 @@ async fn handle_near_call(
 
     info!("near-call: method={}", method);
 
-    let result = Contract(state.contract_id.clone())
-        .call_function(method, args.clone())
-        .transaction()
-        .with_signer(state.owner_id.clone(), state.owner_signer.clone())
-        .send_to(&state.network)
-        .await;
+    if method == "push_objects" {
+        // Convert JSON objects to borsh GitObjects
+        let objects_json = args["objects"].as_array();
+        let git_objects: Vec<GitObject> = objects_json
+            .map(|arr| {
+                arr.iter()
+                    .map(|obj| {
+                        let data_b64 = obj["data"].as_str().unwrap_or("");
+                        let data = base64::engine::general_purpose::STANDARD
+                            .decode(data_b64)
+                            .unwrap_or_default();
+                        GitObject {
+                            sha: obj["sha"].as_str().unwrap_or("").to_string(),
+                            obj_type: obj["obj_type"].as_str().unwrap_or("blob").to_string(),
+                            data,
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
 
-    match result {
-        Ok(r) => {
-            let tx_hash = r.transaction().get_hash().to_string();
-            if r.is_success() {
-                let full = r.into_full().unwrap();
-                let data: serde_json::Value = full.json().unwrap_or(json!(null));
-                axum::Json(json!({
-                    "success": true,
-                    "result": data,
-                    "txHash": tx_hash,
-                }))
-                .into_response()
-            } else {
-                axum::Json(json!({
-                    "success": false,
-                    "error": "transaction failed",
-                    "txHash": tx_hash,
-                }))
-                .into_response()
+        let result = Contract(state.contract_id.clone())
+            .call_function_borsh("push_objects", &git_objects)
+            .transaction()
+            .with_signer(state.owner_id.clone(), state.owner_signer.clone())
+            .send_to(&state.network)
+            .await;
+
+        match result {
+            Ok(r) => {
+                let tx_hash = r.transaction().get_hash().to_string();
+                if r.is_success() {
+                    let shas: Vec<String> = git_objects.iter().map(|o| o.sha.clone()).collect();
+                    axum::Json(json!({
+                        "success": true,
+                        "result": { "shas": shas },
+                        "txHash": tx_hash,
+                    }))
+                    .into_response()
+                } else {
+                    axum::Json(json!({
+                        "success": false,
+                        "error": "transaction failed",
+                        "txHash": tx_hash,
+                    }))
+                    .into_response()
+                }
+            }
+            Err(e) => {
+                axum::Json(json!({ "success": false, "error": e.to_string() })).into_response()
             }
         }
-        Err(e) => {
-            axum::Json(json!({ "success": false, "error": e.to_string() })).into_response()
+    } else {
+        // Other methods: pass JSON through directly
+        let result = Contract(state.contract_id.clone())
+            .call_function(method, args.clone())
+            .transaction()
+            .with_signer(state.owner_id.clone(), state.owner_signer.clone())
+            .send_to(&state.network)
+            .await;
+
+        match result {
+            Ok(r) => {
+                let tx_hash = r.transaction().get_hash().to_string();
+                if r.is_success() {
+                    let full = r.into_full().unwrap();
+                    let data: serde_json::Value = full.json().unwrap_or(json!(null));
+                    axum::Json(json!({
+                        "success": true,
+                        "result": data,
+                        "txHash": tx_hash,
+                    }))
+                    .into_response()
+                } else {
+                    axum::Json(json!({
+                        "success": false,
+                        "error": "transaction failed",
+                        "txHash": tx_hash,
+                    }))
+                    .into_response()
+                }
+            }
+            Err(e) => {
+                axum::Json(json!({ "success": false, "error": e.to_string() })).into_response()
+            }
         }
     }
 }
