@@ -328,6 +328,67 @@ async fn test_get_refs_empty() {
     assert!(refs.is_empty());
 }
 
+#[tokio::test]
+async fn test_self_delete_clears_storage() {
+    let ctx = setup().await;
+
+    // Push many packs to build up significant storage
+    for i in 0..20u32 {
+        // ~1KB of data per pack
+        let data: Vec<u8> = (0..1000).map(|j| ((i * 1000 + j) % 256) as u8).collect();
+        let sha = format!("aaaa{:036}", i);
+        let old_sha = if i == 0 {
+            None
+        } else {
+            Some(format!("aaaa{:036}", i - 1))
+        };
+        ctx.push_pack(&data, &[RefUpdate {
+            name: "refs/heads/main".to_string(),
+            old_sha,
+            new_sha: sha,
+        }]).await;
+    }
+
+    assert_eq!(ctx.get_pack_count().await, 20);
+
+    let storage_before = ctx.get_storage_bytes().await;
+    eprintln!("Storage before clear: {} bytes ({} packs)", storage_before, 20);
+    assert!(storage_before > 20_000, "Should have significant storage from 20 packs");
+
+    // Step 1: clear storage
+    Contract(ctx.contract_id.clone())
+        .call_function("clear_storage", json!({}))
+        .transaction()
+        .gas(near_api::NearGas::from_tgas(300))
+        .with_signer(ctx.owner_id.clone(), ctx.owner_signer.clone())
+        .send_to(&ctx.network)
+        .await
+        .unwrap()
+        .assert_success();
+
+    let storage_after_clear = ctx.get_storage_bytes().await;
+    eprintln!("Storage after clear: {} bytes", storage_after_clear);
+    assert!(storage_after_clear < storage_before / 2, "Storage should be significantly reduced");
+
+    // Step 2: delete account
+    Contract(ctx.contract_id.clone())
+        .call_function("self_delete", json!({}))
+        .transaction()
+        .gas(near_api::NearGas::from_tgas(300))
+        .with_signer(ctx.owner_id.clone(), ctx.owner_signer.clone())
+        .send_to(&ctx.network)
+        .await
+        .unwrap()
+        .assert_success();
+
+    // Account should no longer exist
+    let view_result = near_api::Account(ctx.contract_id.clone())
+        .view()
+        .fetch_from(&ctx.network)
+        .await;
+    assert!(view_result.is_err(), "Account should be deleted");
+}
+
 /// Helper: create a git repo in a temp dir with initial content, return the path.
 fn create_test_repo(name: &str, content: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("near-git-test-{}-{}", name, std::process::id()));

@@ -124,7 +124,26 @@ impl GitStorage {
         self.owner.clone()
     }
 
+    /// Clear all stored data. Call before self_delete for large repos.
+    /// Also clears legacy data from previous contract versions.
+    /// Can only be called by the owner.
+    pub fn clear_storage(&mut self) {
+        self.assert_owner();
+
+        for i in 0..self.pack_count {
+            self.packs.remove(&i);
+        }
+        self.pack_count = 0;
+
+        let ref_keys: Vec<String> = self.refs.keys().cloned().collect();
+        for key in ref_keys {
+            self.refs.remove(&key);
+        }
+
+    }
+
     /// Delete this repo contract and send remaining funds to the owner.
+    /// For repos with large state, call clear_storage first (separate tx).
     /// Can only be called by the owner.
     pub fn self_delete(&mut self) -> Promise {
         self.assert_owner();
