@@ -488,51 +488,124 @@ pub fn compute_delta(base: &[u8], target: &[u8]) -> Vec<u8> {
 }
 
 /// Build a packfile from a list of objects.
+/// Build a packfile from objects, with OFS_DELTA compression.
+///
+/// Objects of the same type are sorted by size (largest first). Each object
+/// is delta-compressed against the previous object of the same type if the
+/// delta is smaller. This matches git's heuristic for intra-pack deltas.
 pub fn build(objects: &[PackObject]) -> Vec<u8> {
-    let mut out = Vec::new();
+    // Sort: group by type, largest first within each type (better delta bases)
+    let mut sorted: Vec<(usize, &PackObject)> = objects.iter().enumerate().collect();
+    sorted.sort_by(|a, b| {
+        a.1.obj_type.cmp(&b.1.obj_type)
+            .then(b.1.data.len().cmp(&a.1.data.len()))
+    });
 
-    // Header
+    // First pass: decide what to emit for each object (full or delta)
+    struct Entry<'a> {
+        obj: &'a PackObject,
+        /// If Some, this is an OFS_DELTA against the entry at this index in `sorted`
+        delta_base_idx: Option<usize>,
+        delta_data: Option<Vec<u8>>,
+    }
+
+    let mut entries: Vec<Entry> = Vec::with_capacity(sorted.len());
+    let mut last_by_type: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+
+    for (i, (_orig_idx, obj)) in sorted.iter().enumerate() {
+        let mut entry = Entry { obj, delta_base_idx: None, delta_data: None };
+
+        // Try delta against last object of the same type
+        if let Some(&base_idx) = last_by_type.get(obj.obj_type.as_str()) {
+            let base = entries[base_idx].obj;
+            let delta = compute_delta(&base.data, &obj.data);
+            if delta.len() < obj.data.len() * 9 / 10 { // only if >10% savings
+                entry.delta_base_idx = Some(base_idx);
+                entry.delta_data = Some(delta);
+            }
+        }
+
+        last_by_type.insert(&obj.obj_type, i);
+        entries.push(entry);
+    }
+
+    // Second pass: write the packfile
+    let mut out = Vec::new();
     out.extend_from_slice(b"PACK");
     out.extend_from_slice(&2u32.to_be_bytes());
-    out.extend_from_slice(&(objects.len() as u32).to_be_bytes());
+    out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
 
-    // Objects
-    for obj in objects {
-        let type_bits = type_to_bits(&obj.obj_type);
-        let size = obj.data.len() as u64;
+    // Track start positions for OFS_DELTA offset calculation
+    let mut start_positions: Vec<usize> = Vec::with_capacity(entries.len());
 
-        // Encode type + size (variable-length)
-        let mut first_byte = (type_bits << 4) | (size & 0x0f) as u8;
-        let mut remaining = size >> 4;
+    for (i, entry) in entries.iter().enumerate() {
+        let obj_start = out.len();
+        start_positions.push(obj_start);
 
-        if remaining > 0 {
-            first_byte |= 0x80;
+        if let (Some(base_idx), Some(delta)) = (entry.delta_base_idx, &entry.delta_data) {
+            // Emit OFS_DELTA
+            let base_pos = start_positions[base_idx];
+            let offset = obj_start - base_pos;
+            let size = delta.len() as u64;
+
+            // Type + size header (type 6 = OFS_DELTA)
+            encode_pack_header(&mut out, 6, size);
+
+            // Encode negative offset (variable-length, MSB continuation)
+            encode_ofs_offset(&mut out, offset as u64);
+
+            // Zlib-compressed delta data
+            let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(delta).unwrap();
+            out.extend_from_slice(&encoder.finish().unwrap());
+        } else {
+            // Emit full object
+            let type_bits = type_to_bits(&entry.obj.obj_type);
+            let size = entry.obj.data.len() as u64;
+
+            encode_pack_header(&mut out, type_bits, size);
+
+            let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(&entry.obj.data).unwrap();
+            out.extend_from_slice(&encoder.finish().unwrap());
         }
-        out.push(first_byte);
-
-        while remaining > 0 {
-            let mut byte = (remaining & 0x7f) as u8;
-            remaining >>= 7;
-            if remaining > 0 {
-                byte |= 0x80;
-            }
-            out.push(byte);
-        }
-
-        // Compress data with zlib
-        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(&obj.data).unwrap();
-        let compressed = encoder.finish().unwrap();
-        out.extend_from_slice(&compressed);
     }
 
     // Trailing SHA-1 checksum
     let mut hasher = Sha1::new();
     hasher.update(&out);
-    let checksum = hasher.finalize();
-    out.extend_from_slice(&checksum);
+    out.extend_from_slice(&hasher.finalize());
 
     out
+}
+
+/// Encode pack object header (type + size, variable-length).
+fn encode_pack_header(out: &mut Vec<u8>, type_bits: u8, size: u64) {
+    let mut first_byte = (type_bits << 4) | (size & 0x0f) as u8;
+    let mut remaining = size >> 4;
+    if remaining > 0 { first_byte |= 0x80; }
+    out.push(first_byte);
+    while remaining > 0 {
+        let mut byte = (remaining & 0x7f) as u8;
+        remaining >>= 7;
+        if remaining > 0 { byte |= 0x80; }
+        out.push(byte);
+    }
+}
+
+/// Encode OFS_DELTA negative offset (variable-length, MSB continuation).
+fn encode_ofs_offset(out: &mut Vec<u8>, offset: u64) {
+    let mut bytes = Vec::new();
+    let mut off = offset;
+    bytes.push((off & 0x7f) as u8);
+    off >>= 7;
+    while off > 0 {
+        off -= 1;
+        bytes.push((off & 0x7f) as u8 | 0x80);
+        off >>= 7;
+    }
+    bytes.reverse();
+    out.extend_from_slice(&bytes);
 }
 
 #[cfg(test)]
@@ -557,10 +630,11 @@ mod tests {
 
         assert_eq!(result.objects.len(), 2);
         assert!(result.deltas.is_empty());
-        assert_eq!(result.objects[0].obj_type, "blob");
-        assert_eq!(result.objects[0].data, b"hello world\n");
-        assert_eq!(result.objects[1].obj_type, "blob");
-        assert_eq!(result.objects[1].data, b"another file\n");
+        // Objects may be reordered by the delta-aware builder (sorted by type+size)
+        let mut datas: Vec<&[u8]> = result.objects.iter().map(|o| o.data.as_slice()).collect();
+        datas.sort();
+        assert!(datas.contains(&b"hello world\n".as_slice()));
+        assert!(datas.contains(&b"another file\n".as_slice()));
     }
 
     #[test]
@@ -680,5 +754,51 @@ mod tests {
         assert_eq!(result.objects[0].data, base_data);
         assert_eq!(result.objects[1].data, target_data);
         assert_eq!(result.objects[1].obj_type, "blob");
+    }
+
+    #[test]
+    fn test_build_delta_compression() {
+        // Two similar blobs — the builder should delta-compress the smaller one
+        let base = b"line 1: hello world content here\nline 2: more content\nline 3: even more\n";
+        let target = b"line 1: hello world content HERE\nline 2: more content\nline 3: even more\n";
+
+        let objects = vec![
+            PackObject { obj_type: "blob".to_string(), data: base.to_vec() },
+            PackObject { obj_type: "blob".to_string(), data: target.to_vec() },
+        ];
+
+        let packed_with_delta = build(&objects);
+
+        // Build without delta for comparison: use individual full objects
+        let mut packed_no_delta = Vec::new();
+        packed_no_delta.extend_from_slice(b"PACK");
+        packed_no_delta.extend_from_slice(&2u32.to_be_bytes());
+        packed_no_delta.extend_from_slice(&2u32.to_be_bytes());
+        for obj in &objects {
+            encode_pack_header(&mut packed_no_delta, type_to_bits(&obj.obj_type), obj.data.len() as u64);
+            let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+            enc.write_all(&obj.data).unwrap();
+            packed_no_delta.extend_from_slice(&enc.finish().unwrap());
+        }
+        let mut hasher = Sha1::new();
+        hasher.update(&packed_no_delta);
+        packed_no_delta.extend_from_slice(&hasher.finalize());
+
+        eprintln!("Pack with delta: {} bytes, without: {} bytes",
+            packed_with_delta.len(), packed_no_delta.len());
+        assert!(
+            packed_with_delta.len() < packed_no_delta.len(),
+            "Delta pack ({}) should be smaller than full pack ({})",
+            packed_with_delta.len(), packed_no_delta.len()
+        );
+
+        // Verify roundtrip — all content preserved
+        let result = parse(&packed_with_delta).unwrap();
+        assert_eq!(result.objects.len(), 2);
+        assert!(result.deltas.is_empty());
+        let mut datas: Vec<Vec<u8>> = result.objects.iter().map(|o| o.data.clone()).collect();
+        datas.sort();
+        assert!(datas.contains(&base.to_vec()));
+        assert!(datas.contains(&target.to_vec()));
     }
 }
