@@ -40,6 +40,8 @@ struct SharedSandbox {
     wasm: Vec<u8>,
     factory_wasm: Vec<u8>,
     global_id: AccountId,
+    /// SHA-256 hash of the git-storage WASM (hex string)
+    wasm_hash: String,
 }
 
 async fn get_shared_sandbox() -> &'static SharedSandbox {
@@ -61,6 +63,13 @@ async fn get_shared_sandbox() -> &'static SharedSandbox {
             let factory_wasm = std::fs::read(FACTORY_WASM)
                 .expect("Factory WASM not found. Run `./build.sh` first.");
 
+            // Compute SHA-256 hash of git-storage WASM for hash-based global contract
+            use sha2::{Digest, Sha256};
+            let wasm_hash: String = Sha256::digest(&wasm)
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect();
+
             // Deploy git-storage WASM as a global contract tied to a "global" account
             let global_secret = near_api::signer::generate_secret_key().unwrap();
             let global_id: AccountId = "global.sandbox".parse().unwrap();
@@ -77,8 +86,8 @@ async fn get_shared_sandbox() -> &'static SharedSandbox {
             let global_signer = Signer::from_secret_key(global_secret).unwrap();
 
             Contract::deploy_global_contract_code(wasm.clone())
-                .as_account_id(global_id.clone())
-                .with_signer(global_signer)
+                .as_hash()
+                .with_signer(global_id.clone(), global_signer)
                 .send_to(&network)
                 .await
                 .unwrap()
@@ -92,6 +101,7 @@ async fn get_shared_sandbox() -> &'static SharedSandbox {
                 wasm,
                 factory_wasm,
                 global_id,
+                wasm_hash,
             }
         })
         .await
@@ -160,7 +170,7 @@ async fn setup() -> TestContext {
 
     Contract::deploy(factory_id.clone())
         .use_code(shared.factory_wasm.clone())
-        .with_init_call("new", json!({ "global_contract": shared.global_id.to_string() }))
+        .with_init_call("new", json!({ "global_contract_hash": &shared.wasm_hash }))
         .unwrap()
         .with_signer(Signer::from_secret_key(factory_secret).unwrap())
         .send_to(&shared.network)

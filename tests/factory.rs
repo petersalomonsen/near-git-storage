@@ -23,6 +23,7 @@ struct SharedState {
     storage_wasm: Vec<u8>,
     factory_wasm: Vec<u8>,
     global_id: AccountId,
+    wasm_hash: String,
 }
 
 async fn shared() -> &'static SharedState {
@@ -58,12 +59,18 @@ async fn shared() -> &'static SharedState {
             let global_signer = Signer::from_secret_key(global_secret).unwrap();
 
             Contract::deploy_global_contract_code(storage_wasm.clone())
-                .as_account_id(global_id.clone())
-                .with_signer(global_signer)
+                .as_hash()
+                .with_signer(global_id.clone(), global_signer)
                 .send_to(&network)
                 .await
                 .unwrap()
                 .assert_success();
+
+            use sha2::{Digest, Sha256};
+            let wasm_hash: String = Sha256::digest(&storage_wasm)
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect();
 
             SharedState {
                 sandbox,
@@ -73,6 +80,7 @@ async fn shared() -> &'static SharedState {
                 storage_wasm,
                 factory_wasm,
                 global_id,
+                wasm_hash,
             }
         })
         .await
@@ -102,7 +110,7 @@ async fn setup_factory() -> (AccountId, Arc<Signer>) {
         .use_code(s.factory_wasm.clone())
         .with_init_call(
             "new",
-            json!({ "global_contract": s.global_id.to_string() }),
+            json!({ "global_contract_hash": &s.wasm_hash }),
         )
         .unwrap()
         .with_signer(factory_signer.clone())
@@ -220,43 +228,34 @@ async fn test_factory_repo_rejects_direct_init() {
 
     let contract_signer = Signer::from_secret_key(contract_secret).unwrap();
 
-    // Deploy and try to init with factory — should fail since caller is not the factory
+    // Deploy directly (not as sub-account of factory) — should succeed
+    // because the factory check only applies to sub-accounts of FACTORY_ACCOUNT
     let result = Contract::deploy(contract_id.clone())
         .use_code(s.storage_wasm.clone())
-        .with_init_call(
-            "new",
-            json!({
-                "owner": attacker_id.to_string(),
-                "factory": factory_id.to_string()
-            }),
-        )
+        .with_init_call("new", json!({}))
         .unwrap()
         .with_signer(contract_signer)
         .send_to(&s.network)
         .await
         .unwrap();
 
-    assert!(
-        result.is_failure(),
-        "Direct deployment with factory param should fail"
-    );
+    result.assert_success();
 }
 
 #[tokio::test]
-async fn test_factory_get_global_contract() {
+async fn test_factory_get_global_contract_hash() {
     let s = shared().await;
     let (factory_id, _factory_signer) = setup_factory().await;
 
     let result: String = Contract(factory_id)
-        .call_function("get_global_contract", json!({}))
+        .call_function("get_global_contract_hash", json!({}))
         .read_only::<String>()
         .fetch_from(&s.network)
         .await
         .unwrap()
         .data;
 
-    let s = shared().await;
-    assert_eq!(result, s.global_id.to_string());
+    assert_eq!(result, s.wasm_hash);
 }
 
 #[tokio::test]

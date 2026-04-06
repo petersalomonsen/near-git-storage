@@ -1,6 +1,12 @@
 use near_sdk::store::{IterableMap, LookupMap};
 use near_sdk::{env, near, AccountId, PanicOnDefault, Promise};
 
+/// The factory account that is authorized to create repos as sub-accounts.
+/// When the contract is deployed as a sub-account of this factory (via global
+/// contract hash), `new()` enforces that only the factory can initialize it.
+/// Standalone deployments (not a sub-account) skip this check.
+const FACTORY_ACCOUNT: &str = "gitfactory.near";
+
 /// A git object SHA-1 hash as a 40-character hex string.
 pub type SHA = String;
 
@@ -65,6 +71,24 @@ pub struct GitStorage {
 impl GitStorage {
     #[init]
     pub fn new() -> Self {
+        // If deployed as a sub-account of the factory (e.g. myrepo.gitfactory.near),
+        // only the factory can call new(). This ensures the factory can charge a
+        // service fee for using the global contract.
+        // Standalone deployments (not a sub-account of the factory) skip this check.
+        let current = env::current_account_id().to_string();
+        let is_factory_sub_account = current
+            .find('.')
+            .map(|i| &current[i + 1..] == FACTORY_ACCOUNT)
+            .unwrap_or(false);
+
+        if is_factory_sub_account {
+            assert_eq!(
+                env::predecessor_account_id().as_str(),
+                FACTORY_ACCOUNT,
+                "Sub-accounts of the factory can only be initialized by the factory"
+            );
+        }
+
         Self {
             refs: IterableMap::new(b"r"),
             object_txs: IterableMap::new(b"o"),

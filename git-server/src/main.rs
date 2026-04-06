@@ -110,15 +110,22 @@ async fn main() {
     let storage_wasm = std::fs::read("res/near_git_storage.wasm")
         .expect("Contract WASM not found. Run `./build.sh` first.");
 
+    // Compute SHA-256 hash for hash-based global contract
+    use sha2::{Digest, Sha256};
+    let wasm_hash: String = Sha256::digest(&storage_wasm)
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect();
+
     Contract::deploy_global_contract_code(storage_wasm)
-        .as_account_id(global_id.clone())
-        .with_signer(Signer::from_secret_key(global_secret).unwrap())
+        .as_hash()
+        .with_signer(global_id.clone(), Signer::from_secret_key(global_secret).unwrap())
         .send_to(&network)
         .await
         .unwrap()
         .assert_success();
 
-    info!("Global contract deployed at {}", global_id);
+    info!("Global contract deployed at {} (hash: {})", global_id, wasm_hash);
 
     // Deploy factory contract
     let factory_secret = near_api::signer::generate_secret_key().unwrap();
@@ -138,7 +145,7 @@ async fn main() {
 
     Contract::deploy(factory_id.clone())
         .use_code(factory_wasm)
-        .with_init_call("new", json!({ "global_contract": global_id.to_string() }))
+        .with_init_call("new", json!({ "global_contract_hash": wasm_hash }))
         .unwrap()
         .with_signer(Signer::from_secret_key(factory_secret).unwrap())
         .send_to(&network)

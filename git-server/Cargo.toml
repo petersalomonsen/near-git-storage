@@ -11,6 +11,7 @@ near-sandbox = { version = "0.3", features = ["generate", "global_install"] }
 near-api = "0.8"
 near-token = "0.3"
 sha1 = "0.10"
+sha2 = "0.10"
 base64 = "0.22"
 borsh = "1"
 serde = { version = "1", features = ["derive"] }
