@@ -494,38 +494,90 @@ pub fn compute_delta(base: &[u8], target: &[u8]) -> Vec<u8> {
 /// is delta-compressed against the previous object of the same type if the
 /// delta is smaller. This matches git's heuristic for intra-pack deltas.
 pub fn build(objects: &[PackObject]) -> Vec<u8> {
-    // Sort: group by type, largest first within each type (better delta bases)
-    let mut sorted: Vec<(usize, &PackObject)> = objects.iter().enumerate().collect();
-    sorted.sort_by(|a, b| {
-        a.1.obj_type.cmp(&b.1.obj_type)
-            .then(b.1.data.len().cmp(&a.1.data.len()))
-    });
+    build_with_bases(objects, &[])
+}
 
-    // First pass: decide what to emit for each object (full or delta)
-    struct Entry<'a> {
-        obj: &'a PackObject,
-        /// If Some, this is an OFS_DELTA against the entry at this index in `sorted`
-        delta_base_idx: Option<usize>,
-        delta_data: Option<Vec<u8>>,
+/// Build a thin packfile: objects delta-compressed against external bases.
+///
+/// `base_objects` are available for delta computation but NOT included in
+/// the output pack. Uses REF_DELTA (type 7) to reference bases by SHA.
+/// The receiver needs the base objects from a previous pack to resolve them.
+pub fn build_with_bases(objects: &[PackObject], base_objects: &[PackObject]) -> Vec<u8> {
+    // Build a map of base objects by type for delta matching
+    let mut bases_by_type: std::collections::HashMap<&str, Vec<&PackObject>> =
+        std::collections::HashMap::new();
+    for obj in base_objects {
+        bases_by_type.entry(&obj.obj_type).or_default().push(obj);
     }
 
-    let mut entries: Vec<Entry> = Vec::with_capacity(sorted.len());
+    // For each object, try to find the best delta base (from bases or intra-pack)
+    struct Entry<'a> {
+        obj: &'a PackObject,
+        /// REF_DELTA against external base (sha, delta_data)
+        ref_delta: Option<(String, Vec<u8>)>,
+        /// OFS_DELTA against intra-pack entry at this index
+        ofs_delta_idx: Option<usize>,
+        ofs_delta_data: Option<Vec<u8>>,
+    }
+
+    let mut entries: Vec<Entry> = Vec::with_capacity(objects.len());
     let mut last_by_type: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
 
-    for (i, (_orig_idx, obj)) in sorted.iter().enumerate() {
-        let mut entry = Entry { obj, delta_base_idx: None, delta_data: None };
+    // Sort objects by type+size for better intra-pack deltas
+    let mut sorted_indices: Vec<usize> = (0..objects.len()).collect();
+    sorted_indices.sort_by(|&a, &b| {
+        objects[a].obj_type.cmp(&objects[b].obj_type)
+            .then(objects[b].data.len().cmp(&objects[a].data.len()))
+    });
 
-        // Try delta against last object of the same type
-        if let Some(&base_idx) = last_by_type.get(obj.obj_type.as_str()) {
-            let base = entries[base_idx].obj;
-            let delta = compute_delta(&base.data, &obj.data);
-            if delta.len() < obj.data.len() * 9 / 10 { // only if >10% savings
-                entry.delta_base_idx = Some(base_idx);
-                entry.delta_data = Some(delta);
+    // Map from original index to entry index
+    let mut orig_to_entry: Vec<usize> = vec![0; objects.len()];
+
+    for &orig_idx in &sorted_indices {
+        let obj = &objects[orig_idx];
+        let entry_idx = entries.len();
+        orig_to_entry[orig_idx] = entry_idx;
+
+        let mut best_delta: Option<Vec<u8>> = None;
+        let mut best_base_sha: Option<String> = None;
+        let mut best_ofs_idx: Option<usize> = None;
+
+        // Try external bases first (usually better — previous version of same file)
+        if let Some(bases) = bases_by_type.get(obj.obj_type.as_str()) {
+            for base in bases {
+                let delta = compute_delta(&base.data, &obj.data);
+                if delta.len() < obj.data.len() * 9 / 10 {
+                    if best_delta.is_none() || delta.len() < best_delta.as_ref().unwrap().len() {
+                        best_delta = Some(delta);
+                        best_base_sha = Some(base.sha1());
+                        best_ofs_idx = None;
+                    }
+                }
             }
         }
 
-        last_by_type.insert(&obj.obj_type, i);
+        // Try intra-pack delta
+        if let Some(&prev_entry_idx) = last_by_type.get(obj.obj_type.as_str()) {
+            let base = entries[prev_entry_idx].obj;
+            let delta = compute_delta(&base.data, &obj.data);
+            if delta.len() < obj.data.len() * 9 / 10 {
+                if best_delta.is_none() || delta.len() < best_delta.as_ref().unwrap().len() {
+                    best_delta = Some(delta);
+                    best_base_sha = None;
+                    best_ofs_idx = Some(prev_entry_idx);
+                }
+            }
+        }
+
+        let entry = if let Some(sha) = best_base_sha {
+            Entry { obj, ref_delta: Some((sha, best_delta.unwrap())), ofs_delta_idx: None, ofs_delta_data: None }
+        } else if let Some(idx) = best_ofs_idx {
+            Entry { obj, ref_delta: None, ofs_delta_idx: Some(idx), ofs_delta_data: best_delta }
+        } else {
+            Entry { obj, ref_delta: None, ofs_delta_idx: None, ofs_delta_data: None }
+        };
+
+        last_by_type.insert(&obj.obj_type, entry_idx);
         entries.push(entry);
     }
 
@@ -535,36 +587,37 @@ pub fn build(objects: &[PackObject]) -> Vec<u8> {
     out.extend_from_slice(&2u32.to_be_bytes());
     out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
 
-    // Track start positions for OFS_DELTA offset calculation
     let mut start_positions: Vec<usize> = Vec::with_capacity(entries.len());
 
-    for (i, entry) in entries.iter().enumerate() {
+    for entry in entries.iter() {
         let obj_start = out.len();
         start_positions.push(obj_start);
 
-        if let (Some(base_idx), Some(delta)) = (entry.delta_base_idx, &entry.delta_data) {
-            // Emit OFS_DELTA
+        if let Some((ref base_sha, ref delta)) = entry.ref_delta {
+            // REF_DELTA (type 7): reference base by SHA
+            encode_pack_header(&mut out, 7, delta.len() as u64);
+            // 20-byte base SHA
+            let sha_bytes: Vec<u8> = (0..20)
+                .map(|i| u8::from_str_radix(&base_sha[i*2..i*2+2], 16).unwrap())
+                .collect();
+            out.extend_from_slice(&sha_bytes);
+            // Zlib-compressed delta
+            let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(delta).unwrap();
+            out.extend_from_slice(&encoder.finish().unwrap());
+        } else if let (Some(base_idx), Some(delta)) = (entry.ofs_delta_idx, &entry.ofs_delta_data) {
+            // OFS_DELTA (type 6): reference base by offset
             let base_pos = start_positions[base_idx];
             let offset = obj_start - base_pos;
-            let size = delta.len() as u64;
-
-            // Type + size header (type 6 = OFS_DELTA)
-            encode_pack_header(&mut out, 6, size);
-
-            // Encode negative offset (variable-length, MSB continuation)
+            encode_pack_header(&mut out, 6, delta.len() as u64);
             encode_ofs_offset(&mut out, offset as u64);
-
-            // Zlib-compressed delta data
             let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
             encoder.write_all(delta).unwrap();
             out.extend_from_slice(&encoder.finish().unwrap());
         } else {
-            // Emit full object
+            // Full object
             let type_bits = type_to_bits(&entry.obj.obj_type);
-            let size = entry.obj.data.len() as u64;
-
-            encode_pack_header(&mut out, type_bits, size);
-
+            encode_pack_header(&mut out, type_bits, entry.obj.data.len() as u64);
             let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
             encoder.write_all(&entry.obj.data).unwrap();
             out.extend_from_slice(&encoder.finish().unwrap());
@@ -800,5 +853,44 @@ mod tests {
         datas.sort();
         assert!(datas.contains(&base.to_vec()));
         assert!(datas.contains(&target.to_vec()));
+    }
+
+    #[test]
+    fn test_build_with_bases_cross_pack_delta() {
+        // Simulate incremental push: base blob is already on-chain,
+        // new blob is a small edit. build_with_bases should produce a
+        // thin pack with REF_DELTA, much smaller than the full blob.
+        let base_data: Vec<u8> = (0..200)
+            .map(|i| format!("line {}: hello world content\n", i))
+            .collect::<String>().into_bytes();
+
+        let mut new_data = base_data.clone();
+        new_data[500] = b'X'; // 1-byte change
+
+        let base_obj = PackObject { obj_type: "blob".to_string(), data: base_data.clone() };
+        let new_obj = PackObject { obj_type: "blob".to_string(), data: new_data.clone() };
+
+        // Pack without bases (full blob)
+        let pack_full = build(&[new_obj.clone()]);
+        // Pack with base (thin pack with REF_DELTA)
+        let pack_delta = build_with_bases(&[new_obj.clone()], &[base_obj.clone()]);
+
+        eprintln!("Cross-pack delta: full={} bytes, with_bases={} bytes",
+            pack_full.len(), pack_delta.len());
+
+        assert!(
+            pack_delta.len() < pack_full.len(),
+            "Thin pack ({}) should be smaller than full pack ({})",
+            pack_delta.len(), pack_full.len()
+        );
+
+        // Parse: the new blob should be an unresolved REF_DELTA
+        let result = parse(&pack_delta).unwrap();
+        assert_eq!(result.deltas.len(), 1, "Should have 1 REF_DELTA");
+        assert_eq!(result.deltas[0].base_sha, base_obj.sha1());
+
+        // Resolve the delta manually and verify content
+        let resolved = apply_delta(&base_data, &result.deltas[0].delta_data).unwrap();
+        assert_eq!(resolved, new_data);
     }
 }

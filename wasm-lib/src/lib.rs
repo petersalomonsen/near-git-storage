@@ -58,6 +58,30 @@ pub fn build_packfile(objects_json: &str) -> Result<Vec<u8>, String> {
     Ok(git_core::packfile::build(&pack_objects))
 }
 
+/// Build a thin packfile with delta compression against external base objects.
+/// `objects_json`: new objects to include (JSON array of {obj_type, data(base64)})
+/// `bases_json`: existing objects for delta computation, NOT included in output
+#[wasm_bindgen]
+pub fn build_packfile_with_bases(objects_json: &str, bases_json: &str) -> Result<Vec<u8>, String> {
+    let parse_objects = |json: &str| -> Result<Vec<git_core::packfile::PackObject>, String> {
+        let values: Vec<serde_json::Value> =
+            serde_json::from_str(json).map_err(|e| e.to_string())?;
+        Ok(values.iter().map(|obj| {
+            let obj_type = obj["obj_type"].as_str().unwrap_or("blob").to_string();
+            let data_b64 = obj["data"].as_str().unwrap_or("");
+            let data = base64::engine::general_purpose::STANDARD
+                .decode(data_b64)
+                .unwrap_or_default();
+            git_core::packfile::PackObject { obj_type, data }
+        }).collect())
+    };
+
+    let objects = parse_objects(objects_json)?;
+    let bases = parse_objects(bases_json)?;
+
+    Ok(git_core::packfile::build_with_bases(&objects, &bases))
+}
+
 /// Apply a binary delta to a source object.
 #[wasm_bindgen]
 pub fn apply_delta(source: &[u8], delta: &[u8]) -> Result<Vec<u8>, String> {
