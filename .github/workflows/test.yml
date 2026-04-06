@@ -31,6 +31,9 @@ jobs:
           curl --proto '=https' --tlsv1.2 -LsSf https://github.com/near/cargo-near/releases/download/cargo-near-v0.17.0/cargo-near-installer.sh | sh
           ./build.sh
 
+      - name: Run integration + factory tests
+        run: RUSTUP_TOOLCHAIN=stable cargo test --test integration --test factory
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22

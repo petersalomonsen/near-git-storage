@@ -9,18 +9,32 @@
 /// or from the NEAR_SIGNER_ACCOUNT / NEAR_SIGNER_KEY env vars.
 ///
 /// Configuration via git config or env:
-///   NEAR_RPC_URL     — RPC endpoint (default: https://archival-rpc.testnet.fastnear.com)
+///   NEAR_RPC_URL     — RPC endpoint (default: https://rpc.testnet.fastnear.com)
 ///   NEAR_SIGNER_ACCOUNT — signer account ID (default: same as contract ID)
 ///   NEAR_SIGNER_KEY  — ed25519:<base58> private key (overrides credentials file)
 ///   NEAR_ENV         — "testnet" or "mainnet" (default: testnet)
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 
-use base64::Engine;
+use borsh::BorshSerialize;
 use near_api::{AccountId, Contract, Signer};
 use serde_json::json;
 
-use git_core::packfile;
+/// Borsh-serialized ref update for push calls.
+#[derive(BorshSerialize, Clone)]
+struct RefUpdate {
+    name: String,
+    old_sha: Option<String>,
+    new_sha: String,
+}
+
+/// Manually borsh-serialize push args (two sequential fields).
+fn encode_push_args(pack_data: &[u8], ref_updates: &[RefUpdate]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    pack_data.serialize(&mut buf).unwrap();
+    ref_updates.to_vec().serialize(&mut buf).unwrap();
+    buf
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -141,8 +155,8 @@ async fn run(contract_id_str: &str) {
 fn resolve_network() -> near_api::NetworkConfig {
     let env = std::env::var("NEAR_ENV").unwrap_or_else(|_| "testnet".to_string());
     let default_rpc = match env.as_str() {
-        "mainnet" => "https://archival-rpc.mainnet.fastnear.com",
-        _ => "https://archival-rpc.testnet.fastnear.com",
+        "mainnet" => "https://rpc.mainnet.fastnear.com",
+        _ => "https://rpc.testnet.fastnear.com",
     };
     let rpc_url = std::env::var("NEAR_RPC_URL").unwrap_or_else(|_| default_rpc.to_string());
     near_api::NetworkConfig::from_rpc_url(&env, rpc_url.parse().unwrap())
@@ -219,134 +233,54 @@ async fn list_refs(
 }
 
 async fn do_fetch(
-    wants: &[String],
+    _wants: &[String],
     contract_id: &AccountId,
     network: &near_api::NetworkConfig,
 ) {
-    // Walk the object graph from wants
-    let mut needed: Vec<String> = Vec::new();
-    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut queue: std::collections::VecDeque<String> = wants.iter().cloned().collect();
+    // Get all packfiles from the contract
+    eprintln!("git-remote-near: fetching packfiles...");
 
-    while let Some(sha) = queue.pop_front() {
-        if visited.contains(&sha) {
-            continue;
-        }
-        visited.insert(sha.clone());
-        needed.push(sha.clone());
-
-        let objects: Vec<(String, Option<serde_json::Value>)> = Contract(contract_id.clone())
-            .call_function("get_objects", json!({ "shas": [&sha] }))
-            .read_only()
-            .fetch_from(network)
-            .await
-            .unwrap()
-            .data;
-
-        for (_sha, maybe_obj) in objects {
-            if let Some(obj) = maybe_obj {
-                let obj_type = obj["obj_type"].as_str().unwrap_or("");
-                let data_b64 = obj["data"].as_str().unwrap_or("");
-                let data = base64::engine::general_purpose::STANDARD
-                    .decode(data_b64)
-                    .unwrap_or_default();
-
-                match obj_type {
-                    "commit" => {
-                        let text = String::from_utf8_lossy(&data);
-                        for line in text.lines() {
-                            if let Some(tree_sha) = line.strip_prefix("tree ") {
-                                queue.push_back(tree_sha.trim().to_string());
-                            } else if let Some(parent_sha) = line.strip_prefix("parent ") {
-                                queue.push_back(parent_sha.trim().to_string());
-                            } else if line.is_empty() {
-                                break;
-                            }
-                        }
-                    }
-                    "tree" => {
-                        let mut pos = 0;
-                        while pos < data.len() {
-                            let null_pos = data[pos..]
-                                .iter()
-                                .position(|&b| b == 0)
-                                .map(|p| pos + p);
-                            if let Some(null_pos) = null_pos {
-                                if null_pos + 21 <= data.len() {
-                                    let child_sha: String = data[null_pos + 1..null_pos + 21]
-                                        .iter()
-                                        .map(|b| format!("{:02x}", b))
-                                        .collect();
-                                    queue.push_back(child_sha);
-                                    pos = null_pos + 21;
-                                } else {
-                                    break;
-                                }
-                            } else {
-                                break;
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    eprintln!("git-remote-near: fetching {} objects", needed.len());
-
-    // Fetch all objects in batches
-    let mut pack_objects = Vec::new();
-    for chunk in needed.chunks(50) {
-        let objects: Vec<(String, Option<serde_json::Value>)> = Contract(contract_id.clone())
-            .call_function("get_objects", json!({ "shas": chunk }))
-            .read_only()
-            .fetch_from(network)
-            .await
-            .unwrap()
-            .data;
-
-        for (_sha, maybe_obj) in objects {
-            if let Some(obj) = maybe_obj {
-                let obj_type = obj["obj_type"].as_str().unwrap_or("blob").to_string();
-                let data_b64 = obj["data"].as_str().unwrap_or("");
-                let data = base64::engine::general_purpose::STANDARD
-                    .decode(data_b64)
-                    .unwrap_or_default();
-                pack_objects.push(packfile::PackObject { obj_type, data });
-            }
-        }
-    }
-
-    // Build packfile and feed to `git index-pack` to import into local repo
-    let pack_data = packfile::build(&pack_objects);
-    eprintln!(
-        "git-remote-near: indexing packfile ({} bytes, {} objects)",
-        pack_data.len(),
-        pack_objects.len()
-    );
-
-    let mut child = std::process::Command::new("git")
-        .args(["index-pack", "--stdin", "--fix-thin"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("failed to run git index-pack");
-
-    child
-        .stdin
-        .as_mut()
+    let packs: Vec<Vec<u8>> = Contract(contract_id.clone())
+        .call_function_borsh("get_packs", &0u32)
+        .read_only_borsh()
+        .fetch_from(network)
+        .await
         .unwrap()
-        .write_all(&pack_data)
-        .unwrap();
+        .data;
 
-    let output = child.wait_with_output().unwrap();
-    if !output.status.success() {
+    eprintln!("git-remote-near: received {} packfiles", packs.len());
+
+    // Feed each packfile to `git index-pack` to import into local repo
+    for (i, pack_data) in packs.iter().enumerate() {
         eprintln!(
-            "git-remote-near: index-pack failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            "git-remote-near: indexing pack {}/{} ({} bytes)",
+            i + 1,
+            packs.len(),
+            pack_data.len()
         );
+
+        let mut child = std::process::Command::new("git")
+            .args(["index-pack", "--stdin", "--fix-thin"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("failed to run git index-pack");
+
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(pack_data)
+            .unwrap();
+
+        let output = child.wait_with_output().unwrap();
+        if !output.status.success() {
+            eprintln!(
+                "git-remote-near: index-pack failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 }
 
@@ -382,11 +316,6 @@ async fn do_push(
         }
     }
 
-    // For each push, we need to:
-    // 1. Figure out which objects are new (not on the remote)
-    // 2. Send them to the contract
-    // 3. Update the refs
-
     // Get current remote refs for comparison
     let remote_refs: Vec<(String, String)> = Contract(contract_id.clone())
         .call_function("get_refs", json!({}))
@@ -400,12 +329,10 @@ async fn do_push(
 
     for op in &ops {
         if op.src_ref.is_empty() {
-            // Delete ref
             results.push(format!("error {} delete not supported yet", op.dst_ref));
             continue;
         }
 
-        // Resolve the local ref to a SHA
         let local_sha = resolve_local_ref(&op.src_ref);
         if local_sha.is_empty() {
             results.push(format!("error {} cannot resolve ref", op.dst_ref));
@@ -414,190 +341,130 @@ async fn do_push(
 
         let old_sha = remote_ref_map.get(&op.dst_ref).cloned();
 
-        // Collect objects to push: walk from local_sha, stop at remote objects
-        let remote_shas: std::collections::HashSet<String> = {
-            let mut set = std::collections::HashSet::new();
-            if let Some(old) = &old_sha {
-                set.insert(old.clone());
-                // Also collect all objects reachable from old to avoid re-pushing
-                collect_reachable_local(old, &mut set);
-            }
-            set
-        };
+        // Check if there are new objects to push
+        let new_shas = collect_new_shas(&local_sha, &old_sha);
 
-        let mut to_push: Vec<packfile::PackObject> = Vec::new();
-        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
-        queue.push_back(local_sha.clone());
-
-        while let Some(sha) = queue.pop_front() {
-            if visited.contains(&sha) || remote_shas.contains(&sha) {
-                continue;
-            }
-            visited.insert(sha.clone());
-
-            // Read from local git
-            if let Some(obj) = read_local_object(&sha) {
-                // Parse children for graph walking
-                match obj.obj_type.as_str() {
-                    "commit" => {
-                        let text = String::from_utf8_lossy(&obj.data);
-                        for line in text.lines() {
-                            if let Some(tree_sha) = line.strip_prefix("tree ") {
-                                queue.push_back(tree_sha.trim().to_string());
-                            } else if let Some(parent_sha) = line.strip_prefix("parent ") {
-                                queue.push_back(parent_sha.trim().to_string());
-                            } else if line.is_empty() {
-                                break;
-                            }
-                        }
-                    }
-                    "tree" => {
-                        let mut pos = 0;
-                        while pos < obj.data.len() {
-                            let null_pos = obj.data[pos..]
-                                .iter()
-                                .position(|&b| b == 0)
-                                .map(|p| pos + p);
-                            if let Some(null_pos) = null_pos {
-                                if null_pos + 21 <= obj.data.len() {
-                                    let child_sha: String =
-                                        obj.data[null_pos + 1..null_pos + 21]
-                                            .iter()
-                                            .map(|b| format!("{:02x}", b))
-                                            .collect();
-                                    queue.push_back(child_sha);
-                                    pos = null_pos + 21;
-                                } else {
-                                    break;
-                                }
-                            } else {
-                                break;
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-                to_push.push(obj);
-            }
-        }
-
-        if to_push.is_empty() {
-            // Nothing new to push, just update ref
-            let ref_updates = vec![json!({
-                "name": op.dst_ref,
-                "old_sha": old_sha,
-                "new_sha": local_sha,
-            })];
+        if new_shas.is_empty() {
+            // Nothing new, just update ref
+            let ref_updates = vec![RefUpdate {
+                name: op.dst_ref.clone(),
+                old_sha: old_sha.clone(),
+                new_sha: local_sha.clone(),
+            }];
+            let empty_pack: Vec<u8> = Vec::new();
 
             match Contract(contract_id.clone())
-                .call_function("register_push", json!({
-                    "tx_hash": "none",
-                    "object_shas": [],
-                    "ref_updates": ref_updates,
-                }))
+                .call_function_raw("push", encode_push_args(&empty_pack, &ref_updates))
                 .transaction()
+                .gas(near_api::NearGas::from_tgas(300))
                 .with_signer(signer_id.clone(), signer.clone())
                 .send_to(network)
                 .await
             {
-                Ok(r) if r.is_success() => {
-                    results.push(format!("ok {}", op.dst_ref));
-                }
-                Ok(r) => {
-                    results.push(format!("error {} {:?}", op.dst_ref, r.assert_failure()));
-                }
-                Err(e) => {
-                    results.push(format!("error {} {}", op.dst_ref, e));
-                }
+                Ok(r) if r.is_success() => results.push(format!("ok {}", op.dst_ref)),
+                Ok(r) => results.push(format!("error {} {:?}", op.dst_ref, r.assert_failure())),
+                Err(e) => results.push(format!("error {} {}", op.dst_ref, e)),
             }
             continue;
         }
 
         eprintln!(
-            "git-remote-near: pushing {} objects for {}",
-            to_push.len(),
+            "git-remote-near: packing {} new objects for {}",
+            new_shas.len(),
             op.dst_ref
         );
 
-        // Push objects to contract
-        let git_objects: Vec<serde_json::Value> = to_push
-            .iter()
-            .map(|obj| {
-                json!({
-                    "obj_type": obj.obj_type,
-                    "data": base64::engine::general_purpose::STANDARD.encode(&obj.data),
-                })
-            })
-            .collect();
-
-        let push_result = Contract(contract_id.clone())
-            .call_function("push_objects", json!({ "objects": git_objects }))
-            .transaction()
-            .with_signer(signer_id.clone(), signer.clone())
-            .send_to(network)
-            .await;
-
-        let (tx_hash, object_shas) = match push_result {
-            Ok(r) => {
-                let tx_hash = r.transaction().get_hash().to_string();
-                if !r.is_success() {
-                    results.push(format!("error {} push_objects failed", op.dst_ref));
-                    continue;
-                }
-                let full = r.into_full().unwrap();
-                let data: serde_json::Value = full.json().unwrap_or(json!(null));
-                let shas: Vec<String> = data["shas"]
-                    .as_array()
-                    .unwrap_or(&Vec::new())
-                    .iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect();
-                (tx_hash, shas)
-            }
-            Err(e) => {
-                results.push(format!("error {} {}", op.dst_ref, e));
-                continue;
-            }
-        };
+        // Build thin packfile with delta compression against existing remote objects
+        let pack_data = build_packfile(&local_sha, &old_sha);
 
         eprintln!(
-            "git-remote-near: pushed {} objects (tx={})",
-            object_shas.len(),
-            tx_hash
+            "git-remote-near: packfile {} bytes (from {} objects, thin={})",
+            pack_data.len(),
+            new_shas.len(),
+            old_sha.is_some()
         );
 
-        // Register push and update refs
-        let ref_updates = vec![json!({
-            "name": op.dst_ref,
-            "old_sha": old_sha,
-            "new_sha": local_sha,
-        })];
+        // Send packfile + ref updates in batches if needed
+        let ref_updates = vec![RefUpdate {
+            name: op.dst_ref.clone(),
+            old_sha: old_sha.clone(),
+            new_sha: local_sha.clone(),
+        }];
 
         match Contract(contract_id.clone())
-            .call_function("register_push", json!({
-                "tx_hash": tx_hash,
-                "object_shas": object_shas,
-                "ref_updates": ref_updates,
-            }))
+            .call_function_raw("push", encode_push_args(&pack_data, &ref_updates))
             .transaction()
+            .gas(near_api::NearGas::from_tgas(300))
             .with_signer(signer_id.clone(), signer.clone())
             .send_to(network)
             .await
         {
-            Ok(r) if r.is_success() => {
-                results.push(format!("ok {}", op.dst_ref));
-            }
-            Ok(r) => {
-                results.push(format!("error {} {:?}", op.dst_ref, r.assert_failure()));
-            }
-            Err(e) => {
-                results.push(format!("error {} {}", op.dst_ref, e));
-            }
+            Ok(r) if r.is_success() => results.push(format!("ok {}", op.dst_ref)),
+            Ok(r) => results.push(format!("error {} {:?}", op.dst_ref, r.assert_failure())),
+            Err(e) => results.push(format!("error {} {}", op.dst_ref, e)),
         }
     }
 
     results
+}
+
+/// Collect SHAs of new objects to push (local objects not in remote).
+fn collect_new_shas(local_sha: &str, old_sha: &Option<String>) -> Vec<String> {
+    // Use `git rev-list --objects <new> --not <old>` to get new objects
+    let mut cmd_args = vec!["rev-list".to_string(), "--objects".to_string(), local_sha.to_string()];
+    if let Some(old) = old_sha {
+        cmd_args.push("--not".to_string());
+        cmd_args.push(old.clone());
+    }
+
+    let output = std::process::Command::new("git")
+        .args(&cmd_args)
+        .output();
+
+    match output {
+        Ok(o) if o.status.success() => {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter_map(|line| {
+                    let sha = line.split_whitespace().next().unwrap_or("");
+                    if sha.is_empty() { None } else { Some(sha.to_string()) }
+                })
+                .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Build a packfile using `git pack-objects --revs --thin`.
+/// `new_sha` is the new commit, `old_sha` is the previous remote HEAD (if any).
+/// Thin packs delta against objects the receiver already has — much smaller for
+/// incremental pushes. For fresh pushes (no old_sha), produces a full pack.
+fn build_packfile(new_sha: &str, old_sha: &Option<String>) -> Vec<u8> {
+    let mut child = std::process::Command::new("git")
+        .args(["pack-objects", "--stdout", "--delta-base-offset", "--revs", "--thin"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to run git pack-objects");
+
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        writeln!(stdin, "{}", new_sha).unwrap();
+        if let Some(old) = old_sha {
+            writeln!(stdin, "--not").unwrap();
+            writeln!(stdin, "{}", old).unwrap();
+        }
+    }
+
+    let output = child.wait_with_output().unwrap();
+    if !output.status.success() {
+        eprintln!(
+            "git-remote-near: pack-objects failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    output.stdout
 }
 
 /// Resolve a local git ref to a SHA using `git rev-parse`.
@@ -610,51 +477,5 @@ fn resolve_local_ref(refspec: &str) -> String {
             String::from_utf8_lossy(&o.stdout).trim().to_string()
         }
         _ => String::new(),
-    }
-}
-
-/// Read a git object from the local repo using `git cat-file`.
-fn read_local_object(sha: &str) -> Option<packfile::PackObject> {
-    // Get type
-    let type_output = std::process::Command::new("git")
-        .args(["cat-file", "-t", sha])
-        .output()
-        .ok()?;
-    if !type_output.status.success() {
-        return None;
-    }
-    let obj_type = String::from_utf8_lossy(&type_output.stdout)
-        .trim()
-        .to_string();
-
-    // Get data
-    let data_output = std::process::Command::new("git")
-        .args(["cat-file", obj_type.as_str(), sha])
-        .output()
-        .ok()?;
-    if !data_output.status.success() {
-        return None;
-    }
-
-    Some(packfile::PackObject {
-        obj_type,
-        data: data_output.stdout,
-    })
-}
-
-/// Collect all SHAs reachable from a given SHA in the local repo.
-fn collect_reachable_local(sha: &str, set: &mut std::collections::HashSet<String>) {
-    let output = std::process::Command::new("git")
-        .args(["rev-list", "--objects", sha])
-        .output();
-    if let Ok(o) = output {
-        if o.status.success() {
-            for line in String::from_utf8_lossy(&o.stdout).lines() {
-                let obj_sha = line.split_whitespace().next().unwrap_or("");
-                if !obj_sha.is_empty() {
-                    set.insert(obj_sha.to_string());
-                }
-            }
-        }
     }
 }

@@ -1,71 +1,62 @@
 # near-git-storage
 
-A NEAR smart contract that stores Git repositories on the NEAR blockchain. Git object data (blobs, trees, commits) is stored directly in contract state, and the contract implements the storage backend for the Git smart HTTP protocol.
+A NEAR smart contract that stores Git repositories on the NEAR blockchain using packfiles with native delta compression. Storage costs are minimal — a 2.1 MB repo stores in ~40 KB on-chain, and incremental edits cost ~400 bytes.
 
 Designed as a decentralized storage backend for [wasm-git](https://github.com/petersalomonsen/wasm-git) web applications where Git is used as an application data store.
 
-## Two ways to use it
+## Three ways to use it
 
-### 1. HTTP git server (sandbox/development)
+### 1. git-remote-near (CLI)
 
-An [axum](https://github.com/tokio-rs/axum)-based HTTP server that implements the Git smart HTTP protocol and talks to a local [NEAR sandbox](https://github.com/near/near-sandbox-rs). Standard git clients work out of the box:
+A Git remote helper that enables `git push/clone` directly to NEAR:
 
 ```
-git clone http://localhost:8080/repo
-cd repo
-echo "hello" > file.txt && git add . && git commit -m "init"
-git push origin master
+cargo install --path git-remote-near
+
+git clone near://myrepo.gitfactory.testnet
+git push near://myrepo.gitfactory.testnet main
 ```
+
+Uses `git pack-objects --thin --revs` for native delta compression. Incremental pushes produce thin packs (~336 bytes for a 1-line edit to a 64 KB file).
 
 ### 2. Browser service worker (testnet/mainnet)
 
 A service worker that intercepts Git HTTP requests from [wasm-git](https://github.com/petersalomonsen/wasm-git) and translates them into NEAR RPC calls — no server required. Transaction signing happens in the browser using a WASM module (ed25519 + borsh), so the private key never leaves the client.
 
+### 3. HTTP git server (sandbox/development)
+
+An [axum](https://github.com/tokio-rs/axum)-based HTTP server for local development with a NEAR sandbox.
+
+## Architecture
+
 ```
-Browser (wasm-git + OPFS)
-    |
-    |  git smart HTTP protocol
-    |  (clone, fetch, push)
-    v
-Service Worker (near-git-sw.js)
-    |  intercepts *.git/* requests
-    |  uses WASM module for:
-    |    - packfile parsing/building
-    |    - NEAR transaction signing
-    |
-    v
+Browser (wasm-git + OPFS)  /  git CLI
+    |                          |
+    v                          v
+Service Worker             git-remote-near
+    |  packfile building       |  git pack-objects --thin
+    |  NEAR tx signing         |  near-api
+    v                          v
 NEAR RPC (testnet or mainnet)
     |
     v
 Smart Contract (near-git-storage)
     |
     +-- refs: Map<refname, SHA>
-    +-- object_types: Map<SHA, type>
-    +-- object_data: Map<SHA, bytes>
-    +-- object_txs: Map<SHA, TxHash>
+    +-- packs: Map<index, packfile_bytes>
+    +-- pack_count: u32
 ```
-
-## Architecture
 
 ### Contract storage
 
+The contract is a minimal key-value store for packfiles:
+
 ```rust
-#[near(contract_state)]
 pub struct GitStorage {
-    /// Branch/tag pointers: "refs/heads/main" -> "abc123..."
-    refs: IterableMap<String, SHA>,
-
-    /// Object locations: SHA -> transaction hash (for archival lookup)
-    object_txs: IterableMap<SHA, TxHash>,
-
-    /// Object types: SHA -> "blob" | "tree" | "commit" | "tag"
-    object_types: LookupMap<SHA, String>,
-
-    /// Object data: SHA -> raw git object bytes
-    object_data: LookupMap<SHA, Vec<u8>>,
-
-    /// Repo owner (only owner can push)
-    owner: AccountId,
+    refs: IterableMap<String, String>,    // branch/tag pointers
+    packs: LookupMap<u32, Vec<u8>>,       // packfiles, one per push
+    pack_count: u32,                      // number of stored packs
+    owner: AccountId,                     // only owner can push
 }
 ```
 
@@ -73,54 +64,58 @@ pub struct GitStorage {
 
 **Push:**
 
-1. Client parses packfile into individual git objects
-2. Calls `push_objects(objects)` — contract computes SHA-1 for each, stores type + data, returns SHAs
-3. Calls `register_push(tx_hash, object_shas, ref_updates)` — contract stores SHA -> tx_hash mappings and updates refs (with compare-and-swap)
+1. Client builds a packfile with delta compression (`git pack-objects` or `build_packfile_with_bases`)
+2. Calls `push(pack_data, ref_updates)` — contract stores packfile verbatim and updates refs (CAS)
 
 **Clone/fetch:**
 
 1. Client calls `get_refs()` to discover branches
-2. Walks the object graph (commit -> tree -> blob) by calling `get_objects(shas)`
-3. Builds a packfile from the retrieved objects and returns it to wasm-git
+2. Calls `get_packs(from_index)` to retrieve packfiles
+3. Feeds packs to `git index-pack --fix-thin` (CLI) or parses them in WASM (browser)
 
 ### Contract methods
 
 ```rust
-/// Store git objects. Computes SHA-1, stores type + data in contract state.
-pub fn push_objects(&mut self, objects: Vec<GitObject>) -> PushObjectsResult
+// Store a packfile and update refs (borsh-serialized)
+pub fn push(&mut self, pack_data: Vec<u8>, ref_updates: Vec<RefUpdate>)
 
-/// Register a push transaction and update refs (compare-and-swap).
-pub fn register_push(&mut self, tx_hash: TxHash, object_shas: Vec<SHA>, ref_updates: Vec<RefUpdate>)
+// Return all refs (JSON, view call)
+pub fn get_refs(&self) -> Vec<(String, String)>
 
-/// Return all refs (view call, free).
-pub fn get_refs(&self) -> Vec<(String, SHA)>
+// Return number of stored packfiles (JSON, view call)
+pub fn get_pack_count(&self) -> u32
 
-/// Return transaction locations for requested objects (view call, free).
-pub fn get_object_locations(&self, shas: Vec<SHA>) -> Vec<(SHA, Option<TxHash>)>
+// Retrieve packfiles from index (borsh, view call)
+pub fn get_packs(&self, from_index: u32) -> Vec<Vec<u8>>
 
-/// Retrieve stored objects by SHA (view call, free).
-pub fn get_objects(&self, shas: Vec<SHA>) -> Vec<(SHA, Option<GitObject>)>
+// Clear all storage (call before self_delete for large repos)
+pub fn clear_storage(&mut self)
+
+// Delete account, send funds to owner
+pub fn self_delete(&mut self) -> Promise
 ```
+
+### Factory & global contracts
+
+Repos are deployed as sub-accounts of a factory (e.g. `myrepo.gitfactory.testnet`) using hash-based global contracts. Each repo is pinned to the exact contract version it was created with — no surprise upgrades. Users migrate by creating a new repo and deleting the old one.
+
+The contract charges a 0.1 NEAR service fee on `new()` to the `FEE_RECIPIENT` (build-time env var) to cover global contract deployment costs.
 
 ## Project structure
 
 ```
 near-git-storage/
-  src/lib.rs            # NEAR smart contract
-  git-core/             # Shared Rust crate: packfile + pkt-line parsing
+  src/lib.rs            # NEAR smart contract (packfile store)
+  factory/              # Factory contract (creates repos as sub-accounts)
+  git-core/             # Shared crate: packfile parse/build, delta, zlib
+  git-remote-near/      # CLI git remote helper
   git-server/           # HTTP git server (axum + NEAR sandbox)
-  wasm-lib/             # WASM module: packfile ops + NEAR tx signing
+  wasm-lib/             # Browser WASM: packfile ops + NEAR tx signing
   e2e/
     public/
-      index.html        # HTTP server demo
-      index-sw.html     # Service worker demo (sandbox)
-      testnet.html      # Service worker demo (testnet)
-      near-git-sw.js    # Service worker (standalone, uses WASM)
-      worker.js         # wasm-git OPFS worker
+      near-git-sw.js    # Service worker
       wasm-lib/         # Built WASM module
-    tests/
-      http-server.spec.js      # E2E: push + re-clone via HTTP server
-      service-worker.spec.js   # E2E: push + re-clone via service worker
+    tests/              # Playwright e2e tests
 ```
 
 ## Getting started
@@ -132,63 +127,50 @@ near-git-storage/
 - Node.js
 - [wasm-pack](https://rustwasm.github.io/wasm-pack/) (for building the browser WASM module)
 
-### Build the contract
+### Build
 
 ```bash
+# Build contracts (default: FEE_RECIPIENT=gitfactory.testnet)
 ./build.sh
+
+# For mainnet:
+FEE_RECIPIENT=gitfactory.near ./build.sh
+
+# Build WASM module for browser
+cd wasm-lib && wasm-pack build --target web
+
+# Install git-remote-near
+cargo install --path git-remote-near
 ```
 
-### Run the HTTP git server (local sandbox)
+### Run tests
 
 ```bash
-cargo run -p git-server
+# Integration + factory tests (starts sandbox automatically)
+cargo test --test integration --test factory
+
+# Playwright e2e tests (starts git-server + sandbox)
+cd e2e && npx playwright test
 ```
 
-This starts a NEAR sandbox, deploys the contract, and serves the git HTTP protocol on `http://localhost:8080/repo`.
+### Testnet deployments
 
-### Run the testnet demo
+- `gitfactory.testnet` — factory contract
+- Web4 UI: https://gitfactory.testnet.page/
+- Cloudflare Pages: https://near-git-storage.pages.dev/create-repo
 
-```bash
-cd e2e
-npm run setup   # copies wasm-git assets
-node serve.mjs
-```
+## Compression results
 
-Open `http://localhost:8081/testnet` and enter your testnet credentials.
-
-### Run the E2E tests
-
-```bash
-cd e2e
-npx playwright test
-```
-
-This starts the git server automatically (fresh sandbox) and runs both the HTTP server and service worker tests.
-
-### Build the WASM module
-
-```bash
-cd wasm-lib
-wasm-pack build --target web --out-dir ../e2e/public/wasm-lib
-```
-
-## Archival RPC
-
-The contract stores a mapping from object SHA to the transaction hash of the `push_objects` call that created it (`object_txs`). This allows retrieving git object data from NEAR archival nodes as an alternative to reading from contract state — useful for reducing storage costs in the future.
-
-- **Provider**: [FastNEAR](https://fastnear.com) archival RPC (`https://archival-rpc.testnet.fastnear.com` for testnet)
+| Metric | Raw objects | Packfile storage |
+|--------|-----------|-----------------|
+| psalomo2026 repo (139 objects) | 2.1 MB | **40 KB** |
+| 1-line edit to 64 KB file | 11 KB | **~400 bytes** |
+| Storage cost estimate | ~21 NEAR | **~0.5 NEAR** |
 
 ## Related projects
 
 - [wasm-git](https://github.com/petersalomonsen/wasm-git) — Git compiled to WebAssembly
-- [wasm-git-apps](https://github.com/petersalomonsen/wasm-git-apps) — Devcontainer for AI-driven web app creation using wasm-git
-- [gitoxide](https://github.com/Byron/gitoxide) — Pure Rust Git implementation
 - [NEAR Protocol](https://near.org) — Layer 1 blockchain with WebAssembly smart contracts
-
-Sources:
-- [near-sandbox-rs](https://github.com/near/near-sandbox-rs)
-- [near-workspaces-rs](https://github.com/near/near-workspaces-rs)
-- [NEAR Integration Tests](https://docs.near.org/sdk/rust/testing/integration-tests)
 
 ## License
 

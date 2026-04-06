@@ -12,6 +12,7 @@
 import init, {
     parse_packfile,
     build_packfile,
+    build_packfile_with_bases,
     apply_delta,
     git_sha1,
     create_signed_transaction,
@@ -108,6 +109,41 @@ async function nearViewCall(method, args) {
     return JSON.parse(new TextDecoder().decode(new Uint8Array(json.result.result)));
 }
 
+/// Borsh view call: encode arg as borsh u32, decode result as borsh Vec<Vec<u8>>.
+async function nearViewCallBorsh(method, fromIndex) {
+    // Borsh-encode u32
+    const argBytes = new Uint8Array(4);
+    new DataView(argBytes.buffer).setUint32(0, fromIndex, true);
+
+    const json = await nearRpc('query', {
+        request_type: 'call_function',
+        finality: 'optimistic',
+        account_id: config.contractId,
+        method_name: method,
+        args_base64: uint8ToBase64(argBytes),
+    });
+    if (json.error) throw new Error(JSON.stringify(json.error));
+
+    // Decode borsh Vec<Vec<u8>>: u32 length, then each Vec<u8> is u32 length + bytes
+    const data = new Uint8Array(json.result.result);
+    const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+    let pos = 0;
+    const count = view.getUint32(pos, true); pos += 4;
+    const packs = [];
+    for (let i = 0; i < count; i++) {
+        const len = view.getUint32(pos, true); pos += 4;
+        packs.push(data.slice(pos, pos + len));
+        pos += len;
+    }
+    return packs;
+}
+
+function uint8ToBase64(bytes) {
+    let binary = '';
+    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    return btoa(binary);
+}
+
 async function nearFunctionCall(method, args) {
     // Get nonce and block hash
     const accessKeyRes = await nearRpc('query', {
@@ -120,6 +156,57 @@ async function nearFunctionCall(method, args) {
     const nonce = accessKeyRes.result.nonce + 1;
     const blockHash = accessKeyRes.result.block_hash;
 
+    // Encode args: borsh for push, JSON for others
+    let argsBytes;
+    if (method === 'push') {
+        // Borsh-encode: Vec<u8> pack_data + Vec<RefUpdate> ref_updates
+        const packData = Uint8Array.from(atob(args.pack_data), c => c.charCodeAt(0));
+        const refUpdates = args.ref_updates || [];
+
+        // Manual borsh: pack_data as Vec<u8>
+        const parts = [];
+        const packLen = new Uint8Array(4);
+        new DataView(packLen.buffer).setUint32(0, packData.length, true);
+        parts.push(packLen);
+        parts.push(packData);
+
+        // ref_updates as Vec<RefUpdate>
+        const refLen = new Uint8Array(4);
+        new DataView(refLen.buffer).setUint32(0, refUpdates.length, true);
+        parts.push(refLen);
+        for (const u of refUpdates) {
+            // name: String
+            const nameBytes = new TextEncoder().encode(u.name);
+            const nameLen = new Uint8Array(4);
+            new DataView(nameLen.buffer).setUint32(0, nameBytes.length, true);
+            parts.push(nameLen);
+            parts.push(nameBytes);
+            // old_sha: Option<String>
+            if (u.old_sha) {
+                parts.push(new Uint8Array([1]));
+                const oldBytes = new TextEncoder().encode(u.old_sha);
+                const oldLen = new Uint8Array(4);
+                new DataView(oldLen.buffer).setUint32(0, oldBytes.length, true);
+                parts.push(oldLen);
+                parts.push(oldBytes);
+            } else {
+                parts.push(new Uint8Array([0]));
+            }
+            // new_sha: String
+            const newBytes = new TextEncoder().encode(u.new_sha);
+            const newLen = new Uint8Array(4);
+            new DataView(newLen.buffer).setUint32(0, newBytes.length, true);
+            parts.push(newLen);
+            parts.push(newBytes);
+        }
+        const totalLen = parts.reduce((s, p) => s + p.length, 0);
+        argsBytes = new Uint8Array(totalLen);
+        let offset = 0;
+        for (const p of parts) { argsBytes.set(p, offset); offset += p.length; }
+    } else {
+        argsBytes = new TextEncoder().encode(JSON.stringify(args));
+    }
+
     // Create signed transaction using WASM module
     const signedTxBase64 = create_signed_transaction(
         config.accountId,
@@ -127,7 +214,7 @@ async function nearFunctionCall(method, args) {
         config.privateKey,
         config.contractId,
         method,
-        JSON.stringify(args),
+        argsBytes,
         BigInt(nonce),
         blockHash,
         BigInt(300_000_000_000_000), // 300 TGas
@@ -141,10 +228,15 @@ async function nearFunctionCall(method, args) {
     }
     const result = broadcastRes.result;
     if (result.status && result.status.SuccessValue !== undefined) {
-        const decoded = atob(result.status.SuccessValue);
+        const rawBase64 = result.status.SuccessValue;
+        let decoded = null;
+        if (rawBase64 && method !== 'push') {
+            const text = new TextDecoder().decode(Uint8Array.from(atob(rawBase64), c => c.charCodeAt(0)));
+            decoded = text ? JSON.parse(text) : null;
+        }
         return {
             success: true,
-            result: decoded ? JSON.parse(decoded) : null,
+            result: decoded,
             txHash: result.transaction.hash,
         };
     }
@@ -240,71 +332,99 @@ async function handleReceivePack(body) {
     }
 
     if (rest.length > 0) {
-        // Parse packfile using WASM module
+        // Parse the incoming pack to get individual objects
         const parseJson = parse_packfile(rest);
         const parseResult = JSON.parse(parseJson);
-        if (parseResult.error) {
-            return makeReceivePackResponse([`ng unpack ${parseResult.error}`]);
-        }
 
-        let allObjects = parseResult.objects.map(obj => ({
+        // Extract resolved objects
+        const newObjects = (parseResult.objects || []).map(obj => ({
             obj_type: obj.obj_type,
-            data: Uint8Array.from(atob(obj.data), c => c.charCodeAt(0)),
+            data: obj.data, // already base64
         }));
 
-        // Resolve deltas
+        // Resolve any deltas within the incoming pack
         if (parseResult.deltas && parseResult.deltas.length > 0) {
             const localMap = {};
-            for (const obj of allObjects) {
-                const sha = git_sha1(obj.obj_type, obj.data);
-                localMap[sha] = obj;
+            for (const obj of newObjects) {
+                const data = Uint8Array.from(atob(obj.data), c => c.charCodeAt(0));
+                localMap[git_sha1(obj.obj_type, data)] = obj;
             }
-
             for (const delta of parseResult.deltas) {
-                const deltaData = Uint8Array.from(atob(delta.delta_data), c => c.charCodeAt(0));
-                let base = localMap[delta.base_sha];
-                if (!base) {
-                    const result = await nearViewCall('get_objects', { shas: [delta.base_sha] });
-                    if (result[0] && result[0][1]) {
-                        const objData = result[0][1];
-                        base = {
-                            obj_type: objData.obj_type,
-                            data: Uint8Array.from(atob(objData.data), c => c.charCodeAt(0)),
-                        };
+                const base = localMap[delta.base_sha];
+                if (base) {
+                    const baseData = Uint8Array.from(atob(base.data), c => c.charCodeAt(0));
+                    const deltaData = Uint8Array.from(atob(delta.delta_data), c => c.charCodeAt(0));
+                    const resolved = apply_delta(baseData, deltaData);
+                    const obj = { obj_type: base.obj_type, data: uint8ArrayToBase64(resolved) };
+                    const sha = git_sha1(base.obj_type, resolved);
+                    localMap[sha] = obj;
+                    newObjects.push(obj);
+                }
+            }
+        }
+
+        // Fetch existing objects from on-chain packs as delta bases
+        let packData;
+        const packCount = await nearViewCall('get_pack_count', {});
+        if (packCount > 0) {
+            // Get existing packs and extract objects as bases
+            const existingPacks = await nearViewCallBorsh('get_packs', 0);
+            const baseObjects = [];
+            const baseMap = {};
+            for (const packBytes of existingPacks) {
+                const p = JSON.parse(parse_packfile(packBytes));
+                for (const obj of (p.objects || [])) {
+                    const data = Uint8Array.from(atob(obj.data), c => c.charCodeAt(0));
+                    const sha = git_sha1(obj.obj_type, data);
+                    if (!baseMap[sha]) {
+                        baseMap[sha] = true;
+                        baseObjects.push(obj);
                     }
                 }
-                if (!base) {
-                    return makeReceivePackResponse([`ng unpack base ${delta.base_sha} not found`]);
+                // Resolve ofs_deltas within each existing pack
+                if (p.deltas) {
+                    for (const delta of p.deltas) {
+                        if (baseMap[delta.base_sha]) {
+                            // find the base in baseObjects
+                            const base = baseObjects.find(o => {
+                                const d = Uint8Array.from(atob(o.data), c => c.charCodeAt(0));
+                                return git_sha1(o.obj_type, d) === delta.base_sha;
+                            });
+                            if (base) {
+                                const baseData = Uint8Array.from(atob(base.data), c => c.charCodeAt(0));
+                                const deltaData = Uint8Array.from(atob(delta.delta_data), c => c.charCodeAt(0));
+                                const resolved = apply_delta(baseData, deltaData);
+                                const sha = git_sha1(base.obj_type, resolved);
+                                if (!baseMap[sha]) {
+                                    baseMap[sha] = true;
+                                    baseObjects.push({ obj_type: base.obj_type, data: uint8ArrayToBase64(resolved) });
+                                }
+                            }
+                        }
+                    }
                 }
-                const resolved = apply_delta(base.data, deltaData);
-                const obj = { obj_type: base.obj_type, data: resolved };
-                const sha = git_sha1(obj.obj_type, obj.data);
-                localMap[sha] = obj;
-                allObjects.push(obj);
             }
+
+            // Filter out objects we already have
+            const filteredNew = newObjects.filter(obj => {
+                const data = Uint8Array.from(atob(obj.data), c => c.charCodeAt(0));
+                return !baseMap[git_sha1(obj.obj_type, data)];
+            });
+
+            console.log(`[near-git-sw] push: ${filteredNew.length} new objects, ${baseObjects.length} bases`);
+            packData = build_packfile_with_bases(JSON.stringify(filteredNew), JSON.stringify(baseObjects));
+        } else {
+            // First push — no bases
+            packData = build_packfile(JSON.stringify(newObjects));
         }
 
-        // Push objects to contract (signed locally)
-        const gitObjects = allObjects.map(obj => ({
-            obj_type: obj.obj_type,
-            data: uint8ArrayToBase64(obj.data),
-        }));
-
-        const pushResult = await nearFunctionCall('push_objects', { objects: gitObjects });
-        if (!pushResult.success) {
-            return makeReceivePackResponse([`ng unpack ${pushResult.error}`]);
-        }
-
-        const objectShas = pushResult.result.shas;
-        const txHash = pushResult.txHash;
-
-        const registerResult = await nearFunctionCall('register_push', {
-            tx_hash: txHash,
-            object_shas: objectShas,
+        const packB64 = uint8ArrayToBase64(packData);
+        const pushResult = await nearFunctionCall('push', {
+            pack_data: packB64,
             ref_updates: refUpdates,
         });
-        if (!registerResult.success) {
-            return makeReceivePackResponse([`ng refs ${registerResult.error}`]);
+        if (!pushResult.success) {
+            return makeReceivePackResponse([`ng unpack ${pushResult.error}`]);
         }
     }
 
@@ -334,57 +454,55 @@ async function handleUploadPack(body) {
         );
     }
 
-    // Walk object graph
-    const havesSet = new Set(haves);
-    const needed = [];
-    const visited = new Set();
-    const queue = [...wants];
+    // Get all packfiles from contract and merge into one response
+    const packCount = await nearViewCall('get_pack_count', {});
+    console.log(`[near-git-sw] fetching ${packCount} packs`);
 
-    while (queue.length > 0) {
-        const sha = queue.shift();
-        if (visited.has(sha) || havesSet.has(sha)) continue;
-        visited.add(sha);
-        needed.push(sha);
+    if (packCount === 0) {
+        return new Response(
+            concatUint8Arrays([pktLineEncodeString('NAK\n'), pktLineFlush()]),
+            { headers: { 'Content-Type': 'application/x-git-upload-pack-result' } },
+        );
+    }
 
-        const objects = await nearViewCall('get_objects', { shas: [sha] });
-        for (const [, maybeObj] of objects) {
-            if (!maybeObj) continue;
-            const data = Uint8Array.from(atob(maybeObj.data), c => c.charCodeAt(0));
+    // Fetch all packs via borsh view call
+    const packsResult = await nearViewCallBorsh('get_packs', 0);
 
-            if (maybeObj.obj_type === 'commit') {
-                for (const line of decoder.decode(data).split('\n')) {
-                    if (line.startsWith('tree ')) queue.push(line.slice(5).trim());
-                    else if (line.startsWith('parent ')) queue.push(line.slice(7).trim());
-                    else if (line === '') break;
+    // Parse all packs, merge objects, rebuild into one pack
+    const allObjects = [];
+    const localMap = {};
+    for (const packBytes of packsResult) {
+        const parseJson = parse_packfile(packBytes);
+        const parseResult = JSON.parse(parseJson);
+        if (parseResult.objects) {
+            for (const obj of parseResult.objects) {
+                const data = Uint8Array.from(atob(obj.data), c => c.charCodeAt(0));
+                const sha = git_sha1(obj.obj_type, data);
+                if (!localMap[sha]) {
+                    localMap[sha] = { obj_type: obj.obj_type, data };
+                    allObjects.push(obj);
                 }
-            } else if (maybeObj.obj_type === 'tree') {
-                let pos = 0;
-                while (pos < data.length) {
-                    const nullPos = data.indexOf(0, pos);
-                    if (nullPos === -1 || nullPos + 21 > data.length) break;
-                    const childSha = Array.from(data.slice(nullPos + 1, nullPos + 21))
-                        .map(b => b.toString(16).padStart(2, '0')).join('');
-                    queue.push(childSha);
-                    pos = nullPos + 21;
+            }
+        }
+        // Resolve deltas using accumulated objects
+        if (parseResult.deltas) {
+            for (const delta of parseResult.deltas) {
+                const deltaData = Uint8Array.from(atob(delta.delta_data), c => c.charCodeAt(0));
+                const base = localMap[delta.base_sha];
+                if (base) {
+                    const resolved = apply_delta(base.data, deltaData);
+                    const obj_type = base.obj_type;
+                    const sha = git_sha1(obj_type, resolved);
+                    if (!localMap[sha]) {
+                        localMap[sha] = { obj_type, data: resolved };
+                        allObjects.push({ obj_type, data: uint8ArrayToBase64(resolved) });
+                    }
                 }
             }
         }
     }
 
-    // Fetch and build packfile using WASM
-    const packObjects = [];
-    for (let i = 0; i < needed.length; i += 50) {
-        const chunk = needed.slice(i, i + 50);
-        const objects = await nearViewCall('get_objects', { shas: chunk });
-        for (const [, maybeObj] of objects) {
-            if (maybeObj) {
-                packObjects.push({ obj_type: maybeObj.obj_type, data: maybeObj.data });
-            }
-        }
-    }
-
-    const packData = build_packfile(JSON.stringify(packObjects));
-
+    const packData = build_packfile(JSON.stringify(allObjects));
     const nak = pktLineEncodeString('NAK\n');
     return new Response(concatUint8Arrays([nak, packData]), {
         headers: { 'Content-Type': 'application/x-git-upload-pack-result' },
