@@ -83,13 +83,22 @@ pub fn parse(data: &[u8]) -> Result<ParseResult, String> {
 
     let num_objects = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
     let mut pos = 12;
-    let mut objects = Vec::new();
-    let mut deltas = Vec::new();
+
+    // First pass: parse all entries, tracking start positions
+    enum ParsedEntry {
+        Object(PackObject),
+        RefDelta(UnresolvedDelta),
+        OfsDelta { base_pos: usize, delta_data: Vec<u8> },
+    }
+
+    let mut entries: Vec<(usize, ParsedEntry)> = Vec::new(); // (start_pos, entry)
 
     for _ in 0..num_objects {
         if pos >= data.len() {
             return Err("unexpected end of packfile".into());
         }
+
+        let obj_start = pos;
 
         // Read type and size (variable-length encoding)
         let first_byte = data[pos];
@@ -128,14 +137,13 @@ pub fn parse(data: &[u8]) -> Result<ParseResult, String> {
                     .map_err(|e| format!("zlib decompression failed for delta: {}", e))?;
                 pos += decoder.total_in() as usize;
 
-                deltas.push(UnresolvedDelta {
+                entries.push((obj_start, ParsedEntry::RefDelta(UnresolvedDelta {
                     base_sha,
                     delta_data,
-                });
+                })));
             }
             6 => {
                 // OFS_DELTA: variable-length negative offset + zlib compressed delta
-                // Read the offset
                 let mut byte = data[pos];
                 pos += 1;
                 let mut offset: u64 = (byte & 0x7f) as u64;
@@ -144,19 +152,18 @@ pub fn parse(data: &[u8]) -> Result<ParseResult, String> {
                     pos += 1;
                     offset = ((offset + 1) << 7) | (byte & 0x7f) as u64;
                 }
-                // We can't easily resolve ofs_delta without tracking object positions
-                // For now, decompress and store as unresolved (caller can handle)
+
+                let base_pos = obj_start.checked_sub(offset as usize)
+                    .ok_or_else(|| format!("ofs_delta offset {} exceeds object position {}", offset, obj_start))?;
+
                 let mut decoder = ZlibDecoder::new(&data[pos..]);
-                let mut _delta_data = Vec::with_capacity(size as usize);
+                let mut delta_data = Vec::with_capacity(size as usize);
                 decoder
-                    .read_to_end(&mut _delta_data)
+                    .read_to_end(&mut delta_data)
                     .map_err(|e| format!("zlib decompression failed for ofs_delta: {}", e))?;
                 pos += decoder.total_in() as usize;
 
-                return Err(format!(
-                    "ofs_delta objects not yet supported (offset={})",
-                    offset
-                ));
+                entries.push((obj_start, ParsedEntry::OfsDelta { base_pos, delta_data }));
             }
             _ => {
                 let obj_type = type_from_bits(type_bits)
@@ -169,10 +176,77 @@ pub fn parse(data: &[u8]) -> Result<ParseResult, String> {
                     .map_err(|e| format!("zlib decompression failed: {}", e))?;
                 pos += decoder.total_in() as usize;
 
-                objects.push(PackObject {
+                entries.push((obj_start, ParsedEntry::Object(PackObject {
                     obj_type: obj_type.to_string(),
                     data: decompressed,
-                });
+                })));
+            }
+        }
+    }
+
+    // Build position-to-index map for OFS_DELTA resolution
+    let mut pos_to_idx: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for (i, (start_pos, _)) in entries.iter().enumerate() {
+        pos_to_idx.insert(*start_pos, i);
+    }
+
+    // Resolve OFS_DELTAs: recursively find the base object and apply delta chain
+    fn resolve_ofs(
+        idx: usize,
+        entries: &[(usize, ParsedEntry)],
+        pos_to_idx: &std::collections::HashMap<usize, usize>,
+        resolved: &mut Vec<Option<PackObject>>,
+    ) -> Result<PackObject, String> {
+        if let Some(obj) = &resolved[idx] {
+            return Ok(obj.clone());
+        }
+        match &entries[idx].1 {
+            ParsedEntry::Object(obj) => {
+                let obj = obj.clone();
+                resolved[idx] = Some(obj.clone());
+                Ok(obj)
+            }
+            ParsedEntry::OfsDelta { base_pos, delta_data } => {
+                let base_idx = pos_to_idx.get(base_pos)
+                    .ok_or_else(|| format!("ofs_delta base at offset {} not found", base_pos))?;
+                let base_obj = resolve_ofs(*base_idx, entries, pos_to_idx, resolved)?;
+                let resolved_data = apply_delta(&base_obj.data, delta_data)?;
+                let obj = PackObject {
+                    obj_type: base_obj.obj_type.clone(),
+                    data: resolved_data,
+                };
+                resolved[idx] = Some(obj.clone());
+                Ok(obj)
+            }
+            ParsedEntry::RefDelta(_) => {
+                Err("cannot resolve ref_delta as ofs_delta base".into())
+            }
+        }
+    }
+
+    let mut resolved: Vec<Option<PackObject>> = vec![None; entries.len()];
+    let mut objects = Vec::new();
+    let mut deltas = Vec::new();
+
+    for i in 0..entries.len() {
+        match &entries[i].1 {
+            ParsedEntry::Object(_) => {
+                let obj = resolve_ofs(i, &entries, &pos_to_idx, &mut resolved)?;
+                objects.push(obj);
+            }
+            ParsedEntry::OfsDelta { .. } => {
+                let obj = resolve_ofs(i, &entries, &pos_to_idx, &mut resolved)?;
+                objects.push(obj);
+            }
+            ParsedEntry::RefDelta(_) => {
+                // Extract the delta - we need to destructure but entries is borrowed
+                // Just match again to get the data
+                if let ParsedEntry::RefDelta(d) = &entries[i].1 {
+                    deltas.push(UnresolvedDelta {
+                        base_sha: d.base_sha.clone(),
+                        delta_data: d.delta_data.clone(),
+                    });
+                }
             }
         }
     }
@@ -518,5 +592,93 @@ mod tests {
 
         let result = apply_delta(source, &delta).unwrap();
         assert_eq!(result, b"hello world");
+    }
+
+    #[test]
+    fn test_ofs_delta() {
+        // Build a packfile with one base blob + one OFS_DELTA referencing it
+        let base_data = b"hello world\n";
+        let target_data = b"hello world! updated\n";
+
+        // Compute the delta from base to target
+        let delta_bytes = compute_delta(base_data, target_data);
+
+        let mut pack = Vec::new();
+
+        // Header: PACK v2, 2 objects
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&2u32.to_be_bytes());
+
+        // Object 1: blob "hello world\n"
+        let obj1_start = pack.len();
+        {
+            let type_bits: u8 = 3; // blob
+            let size = base_data.len() as u64;
+            let mut first_byte = (type_bits << 4) | (size & 0x0f) as u8;
+            let mut remaining = size >> 4;
+            if remaining > 0 { first_byte |= 0x80; }
+            pack.push(first_byte);
+            while remaining > 0 {
+                let mut byte = (remaining & 0x7f) as u8;
+                remaining >>= 7;
+                if remaining > 0 { byte |= 0x80; }
+                pack.push(byte);
+            }
+            let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(base_data).unwrap();
+            pack.extend_from_slice(&encoder.finish().unwrap());
+        }
+
+        // Object 2: OFS_DELTA referencing object 1
+        let obj2_start = pack.len();
+        {
+            let type_bits: u8 = 6; // OFS_DELTA
+            let size = delta_bytes.len() as u64;
+            let mut first_byte = (type_bits << 4) | (size & 0x0f) as u8;
+            let mut remaining = size >> 4;
+            if remaining > 0 { first_byte |= 0x80; }
+            pack.push(first_byte);
+            while remaining > 0 {
+                let mut byte = (remaining & 0x7f) as u8;
+                remaining >>= 7;
+                if remaining > 0 { byte |= 0x80; }
+                pack.push(byte);
+            }
+
+            // Encode negative offset (obj2_start - obj1_start)
+            let offset = obj2_start - obj1_start;
+            // Variable-length encoding: last byte has MSB=0, previous bytes have MSB=1
+            // Encoding: first byte = offset & 0x7f, then (offset = (offset >> 7) - 1) while > 0
+            let mut offset_bytes = Vec::new();
+            let mut off = offset as u64;
+            offset_bytes.push((off & 0x7f) as u8);
+            off >>= 7;
+            while off > 0 {
+                off -= 1;
+                offset_bytes.push((off & 0x7f) as u8 | 0x80);
+                off >>= 7;
+            }
+            offset_bytes.reverse();
+            pack.extend_from_slice(&offset_bytes);
+
+            let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(&delta_bytes).unwrap();
+            pack.extend_from_slice(&encoder.finish().unwrap());
+        }
+
+        // Trailing SHA-1
+        let mut hasher = Sha1::new();
+        hasher.update(&pack);
+        let checksum = hasher.finalize();
+        pack.extend_from_slice(&checksum);
+
+        // Parse and verify
+        let result = parse(&pack).unwrap();
+        assert_eq!(result.objects.len(), 2, "should have 2 resolved objects");
+        assert!(result.deltas.is_empty(), "should have no unresolved deltas");
+        assert_eq!(result.objects[0].data, base_data);
+        assert_eq!(result.objects[1].data, target_data);
+        assert_eq!(result.objects[1].obj_type, "blob");
     }
 }

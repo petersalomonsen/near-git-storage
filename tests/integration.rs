@@ -546,3 +546,83 @@ async fn test_packfile_storage_incremental_push() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[tokio::test]
+async fn test_ofs_delta_packfile_roundtrip() {
+    // Packfiles from `git pack-objects --delta-base-offset` contain OFS_DELTA
+    // entries. The git-server and service worker parse these packs to merge
+    // objects for clone. This test verifies the full roundtrip: create pack
+    // with OFS_DELTA, store on-chain, retrieve, parse.
+    //
+    // Without OFS_DELTA support in packfile::parse(), this test fails with
+    // "ofs_delta objects not yet supported".
+    let ctx = setup().await;
+
+    let dir = std::env::temp_dir().join(format!("near-git-test-ofsdelta-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let run = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&dir)
+            .output()
+            .unwrap()
+    };
+
+    run(&["init"]);
+
+    // Create a ~4KB file so delta compression kicks in
+    let content_v1: String = (0..100)
+        .map(|i| format!("line {}: some content that will be mostly unchanged\n", i))
+        .collect();
+    std::fs::write(dir.join("file.txt"), &content_v1).unwrap();
+    run(&["add", "."]);
+    run(&["-c", "user.name=test", "-c", "user.email=test@test", "commit", "-m", "v1"]);
+
+    // Small edits to force OFS_DELTA in the packfile
+    let mut content_v2 = content_v1.clone();
+    content_v2.insert_str(0, "// small edit\n");
+    std::fs::write(dir.join("file.txt"), &content_v2).unwrap();
+    run(&["add", "."]);
+    run(&["-c", "user.name=test", "-c", "user.email=test@test", "commit", "-m", "v2"]);
+
+    let mut content_v3 = content_v2.clone();
+    content_v3.push_str("// appended line\n");
+    std::fs::write(dir.join("file.txt"), &content_v3).unwrap();
+    run(&["add", "."]);
+    run(&["-c", "user.name=test", "-c", "user.email=test@test", "commit", "-m", "v3"]);
+
+    let head = get_head_sha(&dir);
+    let pack = build_pack(&dir, &head, None);
+
+    eprintln!("=== OFS_DELTA roundtrip test ===");
+    eprintln!("Pack size: {} bytes", pack.len());
+
+    // Parse — OFS_DELTA should be resolved, no unresolved deltas
+    let parsed = git_core::packfile::parse(&pack).unwrap();
+    eprintln!("Parsed: {} objects, {} unresolved deltas", parsed.objects.len(), parsed.deltas.len());
+
+    assert!(parsed.deltas.is_empty(), "OFS_DELTA should be resolved inline");
+    assert!(parsed.objects.len() >= 6, "Expected >=6 objects, got {}", parsed.objects.len());
+
+    // Verify latest file content is in the resolved objects
+    assert!(
+        parsed.objects.iter().any(|o| o.obj_type == "blob" && o.data == content_v3.as_bytes()),
+        "Should find v3 blob content in resolved objects"
+    );
+
+    // Store on-chain, retrieve, re-parse (simulates git-server/service-worker clone)
+    ctx.push_pack(&pack, &[RefUpdate {
+        name: "refs/heads/main".to_string(),
+        old_sha: None,
+        new_sha: head,
+    }]).await;
+
+    let packs = ctx.get_packs(0).await;
+    let reparsed = git_core::packfile::parse(&packs[0]).unwrap();
+    assert_eq!(reparsed.objects.len(), parsed.objects.len());
+    assert!(reparsed.deltas.is_empty());
+
+    std::fs::remove_dir_all(&dir).ok();
+}

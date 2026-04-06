@@ -1789,6 +1789,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "borsh",
+ "git-core",
  "near-api",
  "near-sandbox",
  "near-sdk",

@@ -23,6 +23,7 @@ sha1 = "0.10"
 sha2 = "0.10"
 base64 = "0.22"
 borsh = "1"
+git-core = { path = "git-core" }
 near-sdk = { version = "5.17", features = ["unit-testing"] }
 
 [profile.release]
