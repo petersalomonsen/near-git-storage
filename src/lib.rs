@@ -1,11 +1,11 @@
 use near_sdk::store::{IterableMap, LookupMap};
-use near_sdk::{env, near, AccountId, PanicOnDefault, Promise};
+use near_sdk::{env, near, AccountId, NearToken, PanicOnDefault, Promise};
 
-/// The factory account that is authorized to create repos as sub-accounts.
-/// When the contract is deployed as a sub-account of this factory (via global
-/// contract hash), `new()` enforces that only the factory can initialize it.
-/// Standalone deployments (not a sub-account) skip this check.
-const FACTORY_ACCOUNT: &str = "gitfactory.near";
+/// Account that receives the service fee for using the global contract.
+/// Set at build time: FEE_RECIPIENT=gitfactory.testnet ./build.sh
+const FEE_RECIPIENT: &str = env!("FEE_RECIPIENT");
+/// Service fee charged on every new() call to cover global contract deployment costs.
+const SERVICE_FEE: NearToken = NearToken::from_millinear(100); // 0.1 NEAR
 
 /// A git object SHA-1 hash as a 40-character hex string.
 pub type SHA = String;
@@ -71,23 +71,9 @@ pub struct GitStorage {
 impl GitStorage {
     #[init]
     pub fn new() -> Self {
-        // If deployed as a sub-account of the factory (e.g. myrepo.gitfactory.near),
-        // only the factory can call new(). This ensures the factory can charge a
-        // service fee for using the global contract.
-        // Standalone deployments (not a sub-account of the factory) skip this check.
-        let current = env::current_account_id().to_string();
-        let is_factory_sub_account = current
-            .find('.')
-            .map(|i| &current[i + 1..] == FACTORY_ACCOUNT)
-            .unwrap_or(false);
-
-        if is_factory_sub_account {
-            assert_eq!(
-                env::predecessor_account_id().as_str(),
-                FACTORY_ACCOUNT,
-                "Sub-accounts of the factory can only be initialized by the factory"
-            );
-        }
+        // Pay service fee to cover global contract deployment costs.
+        let fee_recipient: AccountId = FEE_RECIPIENT.parse().unwrap();
+        Promise::new(fee_recipient).transfer(SERVICE_FEE);
 
         Self {
             refs: IterableMap::new(b"r"),

@@ -1,9 +1,6 @@
 use near_sdk::serde::{Deserialize, Serialize};
 use near_sdk::{env, near, AccountId, NearSchema, NearToken, PanicOnDefault, Promise};
 
-/// Fee charged by the factory for using the global contract.
-const SERVICE_FEE: NearToken = NearToken::from_millinear(100); // 0.1 NEAR
-
 #[derive(Debug, Serialize, Deserialize, NearSchema)]
 #[serde(crate = "near_sdk::serde")]
 pub struct Web4Request {
@@ -50,7 +47,7 @@ impl GitFactory {
     /// The repo name becomes `{repo_name}.{factory_account}`.
     /// The caller becomes the owner of the repo.
     ///
-    /// A service fee of 0.1 NEAR is deducted; the rest funds the repo account.
+    /// The repo contract's new() transfers 0.1 NEAR service fee to the fee recipient.
     #[payable]
     pub fn create_repo(&mut self, repo_name: String) -> Promise {
         let factory_account = env::current_account_id();
@@ -60,15 +57,13 @@ impl GitFactory {
 
         let deposit = env::attached_deposit();
         assert!(
-            deposit > SERVICE_FEE,
-            "Attach more than 0.1 NEAR (0.1 service fee + storage funding)"
+            deposit >= NearToken::from_near(1),
+            "Attach at least 1 NEAR for account creation and storage"
         );
-
-        let repo_funding = deposit.saturating_sub(SERVICE_FEE);
 
         Promise::new(sub_account)
             .create_account()
-            .transfer(repo_funding)
+            .transfer(deposit)
             .use_global_contract(self.global_contract_hash.clone())
             .function_call(
                 "new".to_string(),
