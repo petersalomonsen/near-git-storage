@@ -20,11 +20,22 @@ pub struct PackObject {
     pub data: Vec<u8>,
 }
 
-/// An unresolved ref_delta from a packfile.
+/// An unresolved delta whose ultimate base lives in another packfile.
+///
+/// The simple case is a plain REF_DELTA: `delta_data` is applied to the
+/// object identified by `base_sha`, `chain` is empty.
+///
+/// The chained case is an OFS_DELTA stacked on top of (possibly several
+/// OFS_DELTAs stacked on top of) a REF_DELTA — the OFS resolution couldn't
+/// happen inside this pack because the bottom of the chain is the foreign
+/// REF_DELTA. `chain` then carries the additional OFS deltas in apply
+/// order, so the caller computes:
+///   `apply_delta(... apply_delta(apply_delta(base_obj, delta_data), chain[0]) ..., chain[N-1])`
 #[derive(Debug, Clone)]
 pub struct UnresolvedDelta {
     pub base_sha: String,
     pub delta_data: Vec<u8>,
+    pub chain: Vec<Vec<u8>>,
 }
 
 /// Result of parsing a packfile.
@@ -140,6 +151,7 @@ pub fn parse(data: &[u8]) -> Result<ParseResult, String> {
                 entries.push((obj_start, ParsedEntry::RefDelta(UnresolvedDelta {
                     base_sha,
                     delta_data,
+                    chain: Vec::new(),
                 })));
             }
             6 => {
@@ -190,63 +202,70 @@ pub fn parse(data: &[u8]) -> Result<ParseResult, String> {
         pos_to_idx.insert(*start_pos, i);
     }
 
-    // Resolve OFS_DELTAs: recursively find the base object and apply delta chain
-    fn resolve_ofs(
+    // Resolution outcome for an entry: either fully resolved within this pack,
+    // or terminating in a foreign REF_DELTA whose base lives elsewhere — in
+    // which case we hand back the chain of deltas the caller must apply on
+    // top of that base SHA, in apply order.
+    #[derive(Clone)]
+    enum Resolution {
+        Object(PackObject),
+        External { base_sha: String, deltas: Vec<Vec<u8>> },
+    }
+
+    fn resolve(
         idx: usize,
         entries: &[(usize, ParsedEntry)],
         pos_to_idx: &std::collections::HashMap<usize, usize>,
-        resolved: &mut Vec<Option<PackObject>>,
-    ) -> Result<PackObject, String> {
-        if let Some(obj) = &resolved[idx] {
-            return Ok(obj.clone());
+        cache: &mut Vec<Option<Resolution>>,
+    ) -> Result<Resolution, String> {
+        if let Some(r) = &cache[idx] {
+            return Ok(r.clone());
         }
-        match &entries[idx].1 {
-            ParsedEntry::Object(obj) => {
-                let obj = obj.clone();
-                resolved[idx] = Some(obj.clone());
-                Ok(obj)
-            }
+        let r = match &entries[idx].1 {
+            ParsedEntry::Object(obj) => Resolution::Object(obj.clone()),
+            ParsedEntry::RefDelta(d) => Resolution::External {
+                base_sha: d.base_sha.clone(),
+                deltas: vec![d.delta_data.clone()],
+            },
             ParsedEntry::OfsDelta { base_pos, delta_data } => {
-                let base_idx = pos_to_idx.get(base_pos)
-                    .ok_or_else(|| format!("ofs_delta base at offset {} not found", base_pos))?;
-                let base_obj = resolve_ofs(*base_idx, entries, pos_to_idx, resolved)?;
-                let resolved_data = apply_delta(&base_obj.data, delta_data)?;
-                let obj = PackObject {
-                    obj_type: base_obj.obj_type.clone(),
-                    data: resolved_data,
-                };
-                resolved[idx] = Some(obj.clone());
-                Ok(obj)
+                let base_idx = *pos_to_idx.get(base_pos).ok_or_else(||
+                    format!("ofs_delta base at offset {} not found", base_pos))?;
+                match resolve(base_idx, entries, pos_to_idx, cache)? {
+                    Resolution::Object(base_obj) => {
+                        let resolved_data = apply_delta(&base_obj.data, delta_data)?;
+                        Resolution::Object(PackObject {
+                            obj_type: base_obj.obj_type,
+                            data: resolved_data,
+                        })
+                    }
+                    Resolution::External { base_sha, mut deltas } => {
+                        deltas.push(delta_data.clone());
+                        Resolution::External { base_sha, deltas }
+                    }
+                }
             }
-            ParsedEntry::RefDelta(_) => {
-                Err("cannot resolve ref_delta as ofs_delta base".into())
-            }
-        }
+        };
+        cache[idx] = Some(r.clone());
+        Ok(r)
     }
 
-    let mut resolved: Vec<Option<PackObject>> = vec![None; entries.len()];
+    let mut cache: Vec<Option<Resolution>> = vec![None; entries.len()];
     let mut objects = Vec::new();
     let mut deltas = Vec::new();
 
     for i in 0..entries.len() {
-        match &entries[i].1 {
-            ParsedEntry::Object(_) => {
-                let obj = resolve_ofs(i, &entries, &pos_to_idx, &mut resolved)?;
-                objects.push(obj);
-            }
-            ParsedEntry::OfsDelta { .. } => {
-                let obj = resolve_ofs(i, &entries, &pos_to_idx, &mut resolved)?;
-                objects.push(obj);
-            }
-            ParsedEntry::RefDelta(_) => {
-                // Extract the delta - we need to destructure but entries is borrowed
-                // Just match again to get the data
-                if let ParsedEntry::RefDelta(d) = &entries[i].1 {
-                    deltas.push(UnresolvedDelta {
-                        base_sha: d.base_sha.clone(),
-                        delta_data: d.delta_data.clone(),
-                    });
-                }
+        match resolve(i, &entries, &pos_to_idx, &mut cache)? {
+            Resolution::Object(obj) => objects.push(obj),
+            Resolution::External { base_sha, deltas: mut chain } => {
+                // First entry in `chain` is the bottom REF_DELTA's own data;
+                // the rest are OFS_DELTAs stacked on top of it. UnresolvedDelta
+                // splits this into delta_data (the bottom) + chain (the rest).
+                let head = chain.remove(0);
+                deltas.push(UnresolvedDelta {
+                    base_sha,
+                    delta_data: head,
+                    chain,
+                });
             }
         }
     }
@@ -892,5 +911,84 @@ mod tests {
         // Resolve the delta manually and verify content
         let resolved = apply_delta(&base_data, &result.deltas[0].delta_data).unwrap();
         assert_eq!(resolved, new_data);
+    }
+
+    #[test]
+    fn test_ofs_delta_on_ref_delta_chain() {
+        // Repro for the multi-pack clone bug: a pack whose OFS_DELTA references
+        // a REF_DELTA earlier in the same pack (the REF_DELTA's base lives in
+        // a *different* pack). Previously parse() returned
+        // "cannot resolve ref_delta as ofs_delta base" and the whole clone
+        // failed. parse() now returns the OFS as a chained UnresolvedDelta so
+        // the caller can resolve the external base SHA cross-pack and then
+        // apply the stacked deltas in order.
+        let external_sha = "0123456789abcdef0123456789abcdef01234567";
+        let base = b"hello\n";
+        let target1 = b"hello world\n";
+        let target2 = b"hello world! updated\n";
+        let delta1 = compute_delta(base, target1);
+        let delta2 = compute_delta(target1, target2);
+
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&2u32.to_be_bytes());
+
+        // Object 1: REF_DELTA pointing at external SHA
+        let obj1_start = pack.len();
+        encode_pack_header(&mut pack, 7, delta1.len() as u64);
+        for i in 0..20 {
+            let hex = &external_sha[i * 2..i * 2 + 2];
+            pack.push(u8::from_str_radix(hex, 16).unwrap());
+        }
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(&delta1).unwrap();
+        pack.extend_from_slice(&enc.finish().unwrap());
+
+        // Object 2: OFS_DELTA stacked on object 1
+        let obj2_start = pack.len();
+        encode_pack_header(&mut pack, 6, delta2.len() as u64);
+        let offset = obj2_start - obj1_start;
+        let mut offset_bytes = Vec::new();
+        let mut off = offset as u64;
+        offset_bytes.push((off & 0x7f) as u8);
+        off >>= 7;
+        while off > 0 {
+            off -= 1;
+            offset_bytes.push((off & 0x7f) as u8 | 0x80);
+            off >>= 7;
+        }
+        offset_bytes.reverse();
+        pack.extend_from_slice(&offset_bytes);
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(&delta2).unwrap();
+        pack.extend_from_slice(&enc.finish().unwrap());
+
+        let mut hasher = Sha1::new();
+        hasher.update(&pack);
+        pack.extend_from_slice(&hasher.finalize());
+
+        let result = parse(&pack).expect("parse should succeed for OFS-on-REF chains");
+        assert_eq!(result.objects.len(), 0, "no objects fully resolve within this pack");
+        assert_eq!(result.deltas.len(), 2,
+            "two entries: the REF_DELTA itself and the OFS chained on top");
+
+        // The plain REF_DELTA: empty chain, applies one delta to base.
+        let plain = result.deltas.iter().find(|d| d.chain.is_empty())
+            .expect("plain REF_DELTA entry");
+        assert_eq!(plain.base_sha, external_sha);
+        assert_eq!(apply_delta(base, &plain.delta_data).unwrap(), target1);
+
+        // The chained one: chain holds the OFS's delta_data. Applying
+        // delta_data to base then walking the chain reproduces target2.
+        let chained = result.deltas.iter().find(|d| !d.chain.is_empty())
+            .expect("chained OFS-on-REF entry");
+        assert_eq!(chained.base_sha, external_sha);
+        assert_eq!(chained.chain.len(), 1);
+        let mut current = apply_delta(base, &chained.delta_data).unwrap();
+        for d in &chained.chain {
+            current = apply_delta(&current, d).unwrap();
+        }
+        assert_eq!(current, target2);
     }
 }

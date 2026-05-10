@@ -23,9 +23,16 @@ pub fn parse_packfile(data: &[u8]) -> Result<String, String> {
         .deltas
         .iter()
         .map(|d| {
+            // `chain` carries OFS_DELTAs stacked on top of a foreign REF_DELTA
+            // base — empty for the simple REF_DELTA case. JS applies them in
+            // order on top of `apply_delta(base_obj, delta_data)`.
+            let chain: Vec<String> = d.chain.iter()
+                .map(|c| base64::engine::general_purpose::STANDARD.encode(c))
+                .collect();
             serde_json::json!({
                 "base_sha": d.base_sha,
                 "delta_data": base64::engine::general_purpose::STANDARD.encode(&d.delta_data),
+                "chain": chain,
             })
         })
         .collect();

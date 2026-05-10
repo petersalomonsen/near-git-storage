@@ -447,14 +447,33 @@ async fn handle_upload_pack(
             for obj in &all_objects {
                 local.insert(obj.sha1(), (obj.obj_type.clone(), obj.data.clone()));
             }
-            for delta in &result.deltas {
-                if let Some((obj_type, base_data)) = local.get(&delta.base_sha) {
-                    if let Ok(resolved) = packfile::apply_delta(base_data, &delta.delta_data) {
-                        let obj = packfile::PackObject { obj_type: obj_type.clone(), data: resolved };
-                        local.insert(obj.sha1(), (obj.obj_type.clone(), obj.data.clone()));
-                        all_objects.push(obj);
+            // Multi-pass: a delta's base may live in a later-iterated pack,
+            // and an OFS-on-REF chain (delta.chain) needs the bottom resolved
+            // before the stacked deltas can apply.
+            let mut pending: Vec<&packfile::UnresolvedDelta> = result.deltas.iter().collect();
+            let mut progress = true;
+            while progress && !pending.is_empty() {
+                progress = false;
+                pending.retain(|delta| {
+                    let Some((obj_type, base_data)) = local.get(&delta.base_sha) else {
+                        return true; // keep for next pass
+                    };
+                    let mut current = match packfile::apply_delta(base_data, &delta.delta_data) {
+                        Ok(v) => v,
+                        Err(_) => return false, // give up on this one
+                    };
+                    for d in &delta.chain {
+                        match packfile::apply_delta(&current, d) {
+                            Ok(v) => current = v,
+                            Err(_) => return false,
+                        }
                     }
-                }
+                    let obj = packfile::PackObject { obj_type: obj_type.clone(), data: current };
+                    local.insert(obj.sha1(), (obj.obj_type.clone(), obj.data.clone()));
+                    all_objects.push(obj);
+                    progress = true;
+                    false // resolved, drop
+                });
             }
         }
     }
@@ -643,12 +662,17 @@ async fn handle_parse_packfile(body: Bytes) -> Response {
         .deltas
         .iter()
         .map(|d| {
+            let chain: Vec<String> = d.chain.iter()
+                .map(|c| base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD, c))
+                .collect();
             json!({
                 "base_sha": d.base_sha,
                 "delta_data": base64::Engine::encode(
                     &base64::engine::general_purpose::STANDARD,
                     &d.delta_data
                 ),
+                "chain": chain,
             })
         })
         .collect();
