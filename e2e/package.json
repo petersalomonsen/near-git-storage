@@ -11,7 +11,7 @@
     "test:sw": "npx playwright test tests/service-worker.spec.js"
   },
   "dependencies": {
-    "wasm-git": "^0.0.14"
+    "wasm-git": "^0.0.17"
   },
   "devDependencies": {
     "@near-js/crypto": "^2.5.1",

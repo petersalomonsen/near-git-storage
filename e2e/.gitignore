@@ -1,2 +1,7 @@
 node_modules
 test-results
+
+# Copied from the wasm-git npm package by `npm run setup`; not tracked so
+# version bumps are just a package.json/lockfile diff, not a binary blob.
+public/lg2_opfs.js
+public/lg2_opfs.wasm
